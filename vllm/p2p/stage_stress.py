@@ -114,17 +114,24 @@ class StressDriver:
             await self.e.fire("p2p_feed", items)
 
     async def run(self, *, seconds: float | None = None, max_requests: int | None = None,
-                  report_every: float = 10.0, log=print) -> dict:
+                  report_every: float = 10.0, log=None) -> dict:
         import torch
 
         from vllm.p2p.stage import pack_rows
 
+        log = log or (lambda m: print(m, flush=True))
         t_start = time.perf_counter()
         last, last_fed, last_rows = t_start, 0, 0
         while len(self.reqs) < self.conc and (max_requests is None or self.n_add < max_requests):
             await self._add()
+        log(f"[{time.perf_counter() - t_start:7.0f}s] 已送进 {self.n_add} 条请求，等引擎输出 …")
         while self.reqs:
-            outs = await self.e.outputs()
+            try:
+                outs = await asyncio.wait_for(self.e.outputs(), report_every)
+            except asyncio.TimeoutError:
+                log(f"[{time.perf_counter() - t_start:7.0f}s] {report_every:g}s 没有任何输出（在飞 "
+                    f"{len(self.reqs)}，已加 {self.n_add}，已算 {self.n_rows} 个位置）")
+                continue
             feeds, finished = [], []
             for o in outs.outputs:
                 r = self.reqs.get(o.request_id)
