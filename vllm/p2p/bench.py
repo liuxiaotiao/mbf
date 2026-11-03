@@ -53,10 +53,11 @@ from typing import Mapping, Sequence
 
 try:                                        # 按文件路径运行：同目录直接 import
     from tiered_stats import (continuous_report, cumulative_stats, mark_stats, request_stats,
-                              saturate_report, segment_stats)
+                              saturate_report, segment_stats, summary_csv, summary_table)
 except ImportError:
     from vllm.p2p.tiered_stats import (continuous_report, cumulative_stats, mark_stats,
-                                       request_stats, saturate_report, segment_stats)
+                                       request_stats, saturate_report, segment_stats,
+                                       summary_csv, summary_table)
 try:
     import launch as _launch
 except ImportError:                         # pragma: no cover  python -m vllm.p2p.bench
@@ -960,6 +961,7 @@ def main(argv: list[str] | None = None) -> int:
         "tokens": a.max_tokens,
         "concurrency": inflight,
         "channels": {c: {"nodes": channels[c]["nodes"], "partition": channels[c].get("partition"),
+                         "task": channels[c].get("task"),
                          "gpu_mem": channels[c].get("gpu_mem"),
                          "engine_metrics": mdelta.get(c)} for c in sorted(live)},
         "requests": rows,
@@ -1002,6 +1004,10 @@ def main(argv: list[str] | None = None) -> int:
     out["run"]["marks_stats"] = mark_stats(rows)
     out["run"]["segment_stats"] = segment_stats(rows)
     out["run"]["cumulative_stats"] = cumulative_stats(rows)
+    # 汇总表（全程；--saturate 再加满载段）：列 = 全部 / 各 task 的路径 / 前段（共享）
+    out["run"]["summary_table"] = summary_table(out)
+    if sat is not None:
+        out["run"]["summary_table_steady"] = summary_table(out, steady=True)
     # 与 p2p-framework 连续性测试同一格式的汇总（均值 / 标准差 / 分位数、按 task、资源占用）
     log.info("")
     for ln in continuous_report(out):
@@ -1014,6 +1020,10 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("  失败 %d 条，第一条：%s", len(failed), failed[0])
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    csv_path = a.out.with_suffix(".summary.csv")
+    csv_path.write_text(summary_csv([out["run"].get("summary_table"),
+                                     out["run"].get("summary_table_steady")]), encoding="utf-8-sig")
+    log.info("汇总表（CSV）已写入 %s", csv_path)
     log.info("结果已写入 %s（%d 条）—— 看表：cd <p2p-framework> && ./deploy_15.sh report %s",
              a.out, len(rows), a.out.resolve())
     return 0 if not failed else 1

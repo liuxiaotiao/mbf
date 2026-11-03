@@ -12,6 +12,10 @@
 开头先打与 p2p-framework 连续性测试同一格式的汇总（`continuous_report`：各指标的均值 / 标准差 / p50 / p90 /
 p99 / 最大，单请求 token/s 含排队 / 去排队 / 解码，吞吐、识别，按 task 的表，各节点资源占用）；
 `bench.py` 跑完打的也是这张，逐请求统计另写进结果的 `run.per_request`。
+
+最后是汇总表（`summary_table`）：E2E / TTFT（去排队）、TPOT、输出长度、单请求与解码 token/s、
+输出 / 含 prompt 吞吐、请求/分钟、总输出 token、GPU 利用率、显存峰值与总量、功耗；列为全部、
+各 task（该 task 的请求 + 它的后段流水线）、前段（共享）。`--csv` 写成 CSV。
 """
 
 from __future__ import annotations
@@ -356,7 +360,232 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
                    f"{sum(mu):.0f} / {sum(mt):.0f} MB")
         out.append("    计算占用、torch 峰值：vLLM 不报逐节点的 forward 时长与 PyTorch 显存，记「—」；"
                    "GPU 利用率 = nvidia-smi 采样（SM 有活的时间比）")
+    if not doc.get("_no_summary_table"):
+        out += format_summary_table(summary_table(doc))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 汇总表：每个指标一行；列 = 全部 / 各 task（该 task 的请求 + 它的后段流水线）/ 前段（共享）
+# --------------------------------------------------------------------------- #
+SUMMARY_ROWS = (
+    ("e2e", "E2E (excl. queue) ms", "req", 1),
+    ("ttft", "TTFT (excl. queue) ms", "req", 1),
+    ("tpot", "TPOT ms/token", "req", 2),
+    ("out_len", "Output length (tokens)", "req", 1),
+    ("tok_s", "Per-request tok/s (excl. queue)", "req", 2),
+    ("decode", "Decode tok/s (1000/TPOT)", "req", 2),
+    ("thr_out", "Throughput: output tok/s", "sys", 2),
+    ("thr_all", "Throughput: incl. prompt tok/s", "sys", 2),
+    ("thr_req", "Throughput: requests/min", "sys", 2),
+    ("tot_out", "Total output tokens", "sys", 0),
+    ("gpu_util", "Mean GPU utilization %", "res", 1),
+    ("mem_peak", "Total peak GPU memory (MB)", "res", 0),
+    ("mem_total", "Total GPU memory (MB)", "res", 0),
+    ("power", "Total power (W)", "res", 1),
+)
+
+
+def _e2e_service(r):
+    """端到端（去排队）：提交 → 最后一个 token，减去网关路由与引擎里的排队。"""
+    t = float(r.get("total_ms") or 0) - _queue(r)
+    return t if t > 0 else None
+
+
+def _ttft_service(r):
+    t = float(r.get("prefill_ms") or 0) - _queue(r)
+    return t if t >= 0 else None
+
+
+def _t_first(r):
+    return float(r["t_submit_s"]) + float(r.get("prefill_ms") or 0) / 1e3
+
+
+def _window_tokens(rows, t_a: float, t_b: float) -> float:
+    """[t_a, t_b] 里生成的 token 数（与 bench.window_tokens 同一口径：首 token 计在首 token 时刻，
+    其余按首 token → 最后一个 token 均匀摊开）。"""
+    tot = 0.0
+    for r in rows:
+        n = int(r.get("n_generated") or 0)
+        if n <= 0 or r.get("t_submit_s") is None or r.get("t_done_s") is None:
+            continue
+        tf, td = _t_first(r), float(r["t_done_s"])
+        if t_a <= tf <= t_b:
+            tot += 1
+        if n > 1 and td > tf:
+            tot += (n - 1) * max(0.0, min(td, t_b) - max(tf, t_a)) / (td - tf)
+    return tot
+
+
+def path_groups(doc: dict) -> tuple[dict, list]:
+    """→ ({task: [它的后段流水线上的节点]}, [前段节点])。后段的 task 优先取结果里 channels 的
+    task 字段，没有就看分到这个后段的请求的真实 task（oracle 下就是它服务的 task）。"""
+    rows = list(doc.get("requests") or [])
+    ch_task: dict = {}
+    for r in rows:
+        if r.get("channel") and r.get("true_task"):
+            ch_task.setdefault(r["channel"], defaultdict(int))[r["true_task"]] += 1
+    by_task: dict = defaultdict(list)
+    for name, c in (doc.get("channels") or {}).items():
+        t = c.get("task") or (max(ch_task[name], key=ch_task[name].get) if name in ch_task else None)
+        if t is None and str(name).startswith("back-"):
+            t = str(name)[5:].rsplit("-", 1)[0]
+        for v in c.get("nodes") or []:
+            if v not in by_task[t or "?"]:
+                by_task[t or "?"].append(v)
+    fronts: list = []
+    for r in rows:
+        for v in str(r.get("front") or "").split("+"):
+            if v and v not in fronts:
+                fronts.append(v)
+    # 分段网关下 channels 只有后段；A 的静态通道里前段节点也在 nodes 里 —— 从后段里去掉前段
+    for t in list(by_task):
+        by_task[t] = [v for v in by_task[t] if v not in fronts]
+    return dict(by_task), sorted(fronts)
+
+
+def summary_table(doc: dict, *, steady: bool = False) -> dict | None:
+    """→ {"title", "columns": [列名], "nodes": {列: [节点]}, "rows": [{key, label, kind, values: {列: 值}}]}。
+
+    每列：「全部」= 全部请求、全部节点；task 列 = 真实 task 为它的请求 + 它的后段流水线上的节点；
+    「前段（共享）」只列资源（三个 task 共用，吞吐不单算）。
+    逐请求指标（req）：值是 {mean, std, n}；吞吐（sys）：全程 = 合计 ÷ 墙钟；`steady=True`（--saturate 的
+    满载段）= 满载窗口 [坐满, 第一个 task 发完] 里生成的 token（落在窗口里的部分）÷ 窗口长度，
+    prompt token 按首 token 落在窗口里的请求算、请求数按窗口里完成的算；
+    资源（res）：nvidia-smi 在整个压测期间的采样（GPU 利用率取节点均值，显存与功耗按节点求和）。"""
+    rows_all = list(doc.get("requests") or [])
+    run = doc.get("run") or {}
+    if not rows_all:
+        return None
+    win = None
+    if steady:
+        sat = run.get("saturate") or {}
+        ta, tb = sat.get("t_full_s"), sat.get("t_end_s")
+        if ta is None or tb is None or tb <= ta:
+            return None
+        win = (float(ta), float(tb))
+        req_rows = [r for r in rows_all if r.get("phase") == "steady"]
+        wall = win[1] - win[0]
+        title = f"满载段（第 {win[0]:.0f}s → {win[1]:.0f}s，{wall:.0f}s；逐请求指标只算段内提交并完成的 {len(req_rows)} 条）"
+    else:
+        req_rows = rows_all
+        wall = float(run.get("wall_s") or max(float(r.get("t_done_s") or 0) for r in rows_all) or 1.0)
+        title = f"全程（{len(rows_all)} 条，墙钟 {wall:.0f}s）"
+    tasks = sorted({r.get("true_task") or "?" for r in rows_all})
+    by_task, fronts = path_groups(doc)
+    usage = run.get("nodes") or {}
+    all_nodes = sorted(set(fronts) | {v for vs in by_task.values() for v in vs} | set(usage))
+    cols = ["全部"] + tasks + (["前段（共享）"] if fronts else [])
+    nodes = {"全部": all_nodes, **{t: by_task.get(t, []) for t in tasks}}
+    if fronts:
+        nodes["前段（共享）"] = fronts
+
+    def req_of(col):
+        return req_rows if col == "全部" else [r for r in req_rows if (r.get("true_task") or "?") == col]
+
+    def all_of(col):
+        return rows_all if col == "全部" else [r for r in rows_all if (r.get("true_task") or "?") == col]
+
+    def sys_vals(col):
+        if col == "前段（共享）":
+            return {}
+        if win is None:
+            rs = all_of(col)
+            out_t = sum(int(r.get("n_generated") or 0) for r in rs)
+            in_t = sum(int(r.get("n_prompt") or 0) for r in rs)
+            n_req = len(rs)
+        else:
+            rs = all_of(col)
+            out_t = _window_tokens(rs, *win)
+            in_t = sum(int(r.get("n_prompt") or 0) for r in rs
+                       if r.get("t_submit_s") is not None and win[0] <= _t_first(r) <= win[1])
+            n_req = sum(1 for r in rs if r.get("t_done_s") is not None
+                        and win[0] <= float(r["t_done_s"]) <= win[1])
+        return {"thr_out": out_t / wall, "thr_all": (out_t + in_t) / wall,
+                "thr_req": n_req / wall * 60.0, "tot_out": out_t}
+
+    def res_vals(col):
+        us = [usage[v] for v in nodes.get(col, []) if isinstance(usage.get(v), dict)
+              and not usage[v].get("error")]
+        if not us:
+            return {}
+        gu = [u["gpu_util_mean"] for u in us if u.get("gpu_util_mean") is not None]
+        return {"gpu_util": st.fmean(gu) if gu else None,
+                "mem_peak": sum(float(u.get("mem_used_max_mb") or 0) for u in us),
+                "mem_total": sum(float(u.get("mem_total_mb") or 0) for u in us),
+                "power": sum(float(u.get("power_mean_w") or 0) for u in us)}
+
+    req_fn = {"e2e": _e2e_service, "ttft": _ttft_service, "tpot": _tpot,
+              "out_len": lambda r: r.get("n_generated"), "tok_s": _tok_s_service, "decode": _decode_tok_s}
+    table = {k: {} for k, *_ in SUMMARY_ROWS}
+    for col in cols:
+        sv, rv = sys_vals(col), res_vals(col)
+        for key, _, kind, _ in SUMMARY_ROWS:
+            if kind == "req":
+                if col == "前段（共享）":
+                    table[key][col] = None
+                else:
+                    fs = full_stats([req_fn[key](r) for r in req_of(col)])
+                    table[key][col] = ({"mean": fs["mean"], "std": fs["std"], "n": fs["n"]}
+                                       if fs["n"] else None)
+            elif kind == "sys":
+                table[key][col] = sv.get(key)
+            else:
+                table[key][col] = rv.get(key)
+    return {"title": title, "steady": bool(steady), "columns": cols, "nodes": nodes,
+            "rows": [{"key": k, "label": lab, "kind": kind, "values": table[k]}
+                     for k, lab, kind, _ in SUMMARY_ROWS]}
+
+
+def _fmt_cell(v, digits: int) -> str:
+    if v is None:
+        return "—"
+    if isinstance(v, dict):
+        return f"{v['mean']:.{digits}f} ± {v['std']:.{digits}f}"
+    return f"{v:.{digits}f}"
+
+
+def format_summary_table(t: dict | None) -> list[str]:
+    if not t:
+        return []
+    digits = {k: d for k, _, _, d in SUMMARY_ROWS}
+    cols = t["columns"]
+    w = max(18, max(len(_fmt_cell(r["values"].get(c), digits[r["key"]])) for r in t["rows"] for c in cols) + 2)
+    out = ["", f"  汇总表 · {t['title']}",
+           f"    {'':<34}" + "".join(f"{c:>{w}}" for c in cols)]
+    for r in t["rows"]:
+        out.append(f"    {r['label']:<34}" + "".join(
+            f"{_fmt_cell(r['values'].get(c), digits[r['key']]):>{w}}" for c in cols))
+    out.append("    路径节点：" + "；".join(f"{c} {'+'.join(t['nodes'].get(c) or []) or '—'}"
+                                       for c in cols if c != "全部"))
+    out.append("    逐请求指标 = 均值 ± 标准差（去排队 = 减去网关路由与引擎排队）；task 列的资源只算它的后段流水线，"
+               "前段三个 task 共用、单列；GPU 利用率为节点均值，显存与功耗为节点合计（nvidia-smi，整个压测期间）")
+    return out
+
+
+def summary_csv(tables) -> str:
+    """一个或多个汇总表 → CSV 文本（贴进表格用）：每张表一段，行 = 指标，列 = 全部 / 各 task / 前段；
+    逐请求指标给均值，下面另起一行给标准差。"""
+    import csv
+    import io
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    digits = {k: d for k, _, _, d in SUMMARY_ROWS}
+    for t in tables:
+        if not t:
+            continue
+        w.writerow([t["title"]] + t["columns"])
+        for r in t["rows"]:
+            vals = [r["values"].get(c) for c in t["columns"]]
+            w.writerow([r["label"]] + ["" if v is None else round(v["mean"] if isinstance(v, dict) else v,
+                                                                   digits[r["key"]] + 1) for v in vals])
+            if r["kind"] == "req":
+                w.writerow([f"{r['label']} std"] + ["" if not isinstance(v, dict) else
+                                                    round(v["std"], digits[r["key"]] + 1) for v in vals])
+        w.writerow(["路径节点"] + ["+".join(t["nodes"].get(c) or []) for c in t["columns"]])
+        w.writerow([])
+    return buf.getvalue()
 
 
 def saturate_report(doc: dict) -> list[str]:
@@ -394,8 +623,10 @@ def saturate_report(doc: dict) -> list[str]:
                       "window_inflight_mean": sat.get("window_inflight_mean"),
                       "inflight": sat["target"], "max_tokens": run.get("max_tokens")}
         sub["run"].pop("nodes", None)
+        sub["_no_summary_table"] = True
         out.append("")
         out += continuous_report(sub, title=f"满载段（坐满之后提交、第一个发完之前完成的 {len(steady)} 条）")
+    out += format_summary_table(summary_table(doc, steady=True))
     return out
 
 
@@ -446,6 +677,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--b", required=True, type=Path, help="分段网关的结果")
     ap.add_argument("--a", type=Path, default=None, help="A 的结果（同一批 case）")
+    ap.add_argument("--csv", type=Path, default=None,
+                    help="把汇总表（全程；--saturate 的结果再加满载段）写成 CSV，贴进表格用")
     a = ap.parse_args(argv)
     rb = json.loads(a.b.read_text(encoding="utf-8"))["requests"]
     ra = json.loads(a.a.read_text(encoding="utf-8"))["requests"] if a.a else []
@@ -457,6 +690,10 @@ def main(argv=None) -> int:
         print()
         for ln in saturate_report(db):
             print(ln)
+    if a.csv:
+        a.csv.write_text(summary_csv([summary_table(db), summary_table(db, steady=True)]),
+                         encoding="utf-8-sig")
+        print(f"\n汇总表已写 {a.csv}")
     if a.a:
         print()
         for ln in continuous_report(json.loads(a.a.read_text(encoding="utf-8")),

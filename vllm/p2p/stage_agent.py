@@ -16,6 +16,13 @@ node_rank 0：起 vLLM 的 EngineCore（`AsyncMPClient`，PP 多机时 worker �
 
 `--hf-overrides` 直接给 JSON（不读文件：各节点不必同步 overrides 文件），本程序再加上
 `p2p_stage = {role, layers}`。
+
+前段本机 LR：hf_overrides 里带 `p2p_lr`（`colorplan.py --lr-model …` 生成）时，前段代理在本机
+加载 p2p-framework 的 LR 选择器，prompt 算完那一批输出里的前 L₀ 层统计在本机判出 task，只把
+判定结果交给协调器（网关 `--lr-at front`）。`p2p_lr` 不进模型配置（这里先拿掉）：
+
+    "p2p_lr": {"model": "<selector .npz>", "tasks": {"gsm8k": 1, …}, "p2p_framework": "<目录>",
+               "classes": null, "features": null, "feature_fn": null, "tau_hi": null, "tau_lo": 0.4}
 """
 
 from __future__ import annotations
@@ -60,6 +67,7 @@ def build_engine_args(a: argparse.Namespace):
 
     lo, hi = (int(x) for x in a.layers.split(","))
     ov = json.loads(a.hf_overrides)
+    ov.pop("p2p_lr", None)              # 前段本机 LR 的配置，代理自己用，不进模型配置
     ov["p2p_stage"] = {"role": a.role, "layers": [lo, hi]}
     kw = dict(
         model=a.model, served_model_name=[a.served_model_name], dtype=a.dtype, hf_overrides=ov,
@@ -79,6 +87,42 @@ def build_engine_args(a: argparse.Namespace):
     if a.attention_backend:
         kw["attention_backend"] = a.attention_backend
     return EngineArgs(**kw)
+
+
+def make_front_lr(cfg: dict, *, l0: int, n_experts: int):
+    """→ (feat_hook, 写进 /info 的描述)。前段代理在本机跑 LR：`feat_hook(前段交出的统计)` →
+    `{"verdict": 判定}`（与网关里 `make_lr_classify` 同一个选择器、同一套阈值、同一格式）。"""
+    from pathlib import Path
+
+    from vllm.p2p.identifier import use_p2p_framework
+    from vllm.p2p.tiered_gateway import make_lr_classify
+
+    use_p2p_framework(cfg.get("p2p_framework"))
+    tasks = {str(k): float(v) for k, v in (cfg.get("tasks") or {}).items()}
+    if not tasks:
+        raise SystemExit("p2p_lr 里没有 tasks（部署的 task 与先验）")
+    classify, clf = make_lr_classify(
+        lr_model=cfg["model"], l0=int(l0), n_experts=int(n_experts), tasks=tasks,
+        lr_classes=cfg.get("classes"), lr_features=cfg.get("features"),
+        lr_feature_fn=cfg.get("feature_fn"), tau_hi=cfg.get("tau_hi"),
+        tau_lo=float(cfg.get("tau_lo", 0.40)))
+
+    def hook(feat: dict) -> dict:
+        if isinstance(feat, dict) and "verdict" in feat:      # 已经判过（不会发生，防重入）
+            return feat
+        t0 = time.perf_counter()
+        try:
+            v = dict(classify(feat, {}))
+            for k in ("n_prompt", "n_body"):                   # 这两个由协调器按请求补
+                v.pop(k, None)
+        except Exception as e:                                 # noqa: BLE001 —— 判不出也不能卡住请求
+            v = {"task": None, "error": f"{type(e).__name__}: {e}"}
+        v["lr_ms_front"] = round((time.perf_counter() - t0) * 1e3, 3)
+        return {"verdict": v}
+
+    desc = {"model": Path(cfg["model"]).name, "needs_body": bool(clf.needs_body),
+            "classifier": clf.describe(), "tasks": tasks}
+    return hook, desc
 
 
 def run_headless(a: argparse.Namespace) -> int:
@@ -120,7 +164,18 @@ async def run_head(a: argparse.Namespace) -> int:
     print(f"[stage_agent] EngineCore 就绪（{info['startup_s']}s）；KV {info['kv_blocks']} 块 × "
           f"{info['block_size']}；ZMQ tcp://*:{a.port + 1}，HTTP :{a.port}", flush=True)
 
-    bridge = AgentBridge(client, f"tcp://*:{a.port + 1}", info)
+    hook = None
+    lr_cfg = json.loads(a.hf_overrides).get("p2p_lr")
+    if lr_cfg:
+        if a.role != "front":
+            raise SystemExit("p2p_lr 只能给前段（含第 L₀ 层、交出识别统计的那一段）")
+        lo, hi = (int(x) for x in a.layers.split(","))
+        hook, info["lr"] = make_front_lr(lr_cfg, l0=hi,
+                                         n_experts=int(getattr(mc.hf_config, "num_experts")))
+        print(f"[stage_agent] 前段本机 LR：{info['lr']['classifier']}；task 与先验 {info['lr']['tasks']}",
+              flush=True)
+
+    bridge = AgentBridge(client, f"tcp://*:{a.port + 1}", info, feat_hook=hook)
 
     async def health(_):
         if bridge.dead:

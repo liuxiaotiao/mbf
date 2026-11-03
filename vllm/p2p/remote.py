@@ -129,7 +129,10 @@ class AgentBridge:
       （流式给客户端、判结束）。
     别的代理发来的 [U] 不会被当成协调器。"""
 
-    def __init__(self, client, bind: str, info: dict):
+    def __init__(self, client, bind: str, info: dict, feat_hook=None):
+        """`feat_hook(feat) -> dict`：前段本机 LR（`stage_agent` 的 `p2p_lr`）—— 把前段交出的
+        前 L₀ 层识别统计（`EngineCoreOutput.p2p_feat`）换成本机判出的结果 `{"verdict": …}`
+        再发给协调器。不给 = 原样转发统计，由协调器跑 LR。"""
         import zmq
         import zmq.asyncio
 
@@ -137,6 +140,7 @@ class AgentBridge:
         from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
         self.client, self.info = client, info
+        self.feat_hook = feat_hook
         self.role = info.get("role")
         self.ctx = zmq.asyncio.Context()
         self.sock = self.ctx.socket(zmq.ROUTER)
@@ -269,6 +273,8 @@ class AgentBridge:
             direct: dict[str, list] = {}
             for o in outs.outputs:
                 rid = o.request_id
+                if self.feat_hook is not None and getattr(o, "p2p_feat", None) is not None:
+                    o.p2p_feat = self.feat_hook(o.p2p_feat)      # 前段本机 LR：只交判定结果
                 t = self.t_in.pop(rid, None)
                 if t is not None:
                     meta[rid] = round((now - t) * 1e3, 3)

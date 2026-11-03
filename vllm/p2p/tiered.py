@@ -204,22 +204,27 @@ class TieredCoordinator:
     识别（`classify(feat: dict, req_info: dict) -> verdict dict`，至少有 "task"）：前段在 prompt
     算完的那一批输出里交出前 L₀ 层的逐层路由统计（`EngineCoreOutput.p2p_feat`），绑定前调它。
     `route="task"`（默认）：只记下结果（shadow，绑定仍按请求自带的 task）；`route="lr"`：按判出的
-    task 绑定。结果放在 `result()["info"]["verdict"]`。"""
+    task 绑定。结果放在 `result()["info"]["verdict"]`。
+
+    `front_lr=True`：LR 在前段代理本机跑（`stage_agent` 的 `p2p_lr`），前段交来的已经是
+    `{"verdict": …}`，协调器直接用、不再调 `classify`。"""
 
     def __init__(self, fronts: Engine | Sequence[Engine], backs: Sequence[Engine], *,
                  bind: str | Callable = "least", eos: int | None = None,
                  stop_ids: Sequence[int] = (), ignore_eos: bool = False, logprobs: int = 0,
                  front_pick: str = "speed", direct: bool = False,
-                 classify: Callable[[dict, dict], dict] | None = None, route: str = "task"):
+                 classify: Callable[[dict, dict], dict] | None = None, route: str = "task",
+                 front_lr: bool = False):
         fronts = [fronts] if isinstance(fronts, Engine) else list(fronts)
         if front_pick not in ("speed", "least"):
             raise ValueError(f"front_pick={front_pick!r}；可选 speed / least")
         self.front_pick = front_pick
         if route not in ("task", "lr"):
             raise ValueError(f"route={route!r}；可选 task / lr")
-        if route == "lr" and classify is None:
-            raise ValueError('route="lr" 要给 classify')
+        if route == "lr" and classify is None and not front_lr:
+            raise ValueError('route="lr" 要给 classify（或 front_lr=True：前段本机判）')
         self.classify, self.route = classify, route
+        self.front_lr = bool(front_lr)
         # 直连（remote.AgentBridge 的 K_ROUTE）：绑定后每 token 的 hidden / token 由前后段代理
         # 直接互发，协调器只收 token（流式、判结束）。要求所有引擎都是远端代理。
         self.direct = bool(direct)
@@ -394,7 +399,16 @@ class TieredCoordinator:
         try:
             if r.feat is None:
                 raise RuntimeError("前段没有交出识别统计（前段引擎没开 p2p_stats.emit_lr？）")
-            v = dict(self.classify(r.feat, info))
+            if isinstance(r.feat, dict) and "verdict" in r.feat:
+                # 前段本机 LR 判好的：直接用，补上协调器这边才知道的 prompt / body 长度
+                v = dict(r.feat["verdict"])
+                v["lr_at"] = "front"
+                v["n_prompt"] = r.n_prompt
+                v["n_body"] = sum(int(b) - int(a) for a, b in r.body) if r.body else None
+            elif self.classify is None:
+                raise RuntimeError("前段交来的是统计、不是判定（前段代理没配 p2p_lr？），协调器也没有 LR")
+            else:
+                v = dict(self.classify(r.feat, info))
         except Exception as e:                       # noqa: BLE001
             v = {"task": None, "error": f"{type(e).__name__}: {e}"}
         v["lr_ms"] = round((time.perf_counter() - t0) * 1e3, 3)
@@ -403,7 +417,7 @@ class TieredCoordinator:
             r.task = v.get("task")
 
     async def _bind(self, r: _Req) -> None:
-        if self.classify is not None:
+        if self.classify is not None or self.front_lr:
             self._identify(r)
         b = r.back = self._pick(r)
         b.inflight += 1

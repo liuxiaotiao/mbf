@@ -31,6 +31,11 @@
     python vllm/p2p/tiered_gateway.py --stages … --model-dir … --mode lr \
         --lr-model /home/ubuntu/p2p-framework/selector/selector_body_L8_params.npz
 
+  LR 放在前段（含第 L₀ 层的卡）本机跑：前段引擎的 hf_overrides 带 `p2p_lr`（`colorplan.py
+  --lr-model …` 生成），网关加 `--lr-at front`，不再加载选择器，直接用前段交来的判定：
+
+    python vllm/p2p/tiered_gateway.py --stages … --model-dir … --mode lr --lr-at front
+
 只支持贪心（temperature 0）与 token id 的 prompt（bench 就是这么发的）。停止条件：模型的
 EOS（generation_config 优先，同 vLLM 的默认）+ max_tokens + max_model_len。
 """
@@ -387,6 +392,7 @@ async def _amain(a) -> int:
             raise SystemExit(f"--fronts {a.fronts} 一个前段都没对上（有 {sj['fronts']}）")
 
     engines = []
+    infos: dict[str, dict] = {}
     for c in (*fronts, *backs):
         cl = RemoteClient(c["zmq"])
         try:
@@ -399,13 +405,32 @@ async def _amain(a) -> int:
         print(f"  {c['name']:<20} {c['role']:<5} task={c.get('task') or '—':<10} "
               f"层 {info.get('layers')}  PP={info.get('pp')}  max_num_seqs {info.get('max_num_seqs')}"
               f"  {c['zmq']}", flush=True)
+        infos[c["name"]] = info
         engines.append(Engine(c["name"], c["role"], cl, task=c.get("task")))
     fe = [e for e in engines if e.role == "front"]
     be = [e for e in engines if e.role == "back"]
     eos, stop_ids = load_stop_ids(a.model_dir)
     tok = Tokenizer.from_file(str(Path(a.model_dir) / "tokenizer.json"))
     classify, clf, ident_desc = None, None, None
-    if a.mode in ("lr", "shadow"):
+    front_lr, needs_body = False, False
+    if a.mode in ("lr", "shadow") and a.lr_at == "front":
+        # LR 在各前段代理本机跑：核对每个前段都配了、配的 task 都有后段
+        have = sorted({b.task for b in be if b.task})
+        no_lr = [e.name for e in fe if not infos[e.name].get("lr")]
+        if no_lr:
+            raise SystemExit(f"--lr-at front，但前段 {no_lr} 没有本机 LR（hf_overrides 里没有 p2p_lr；"
+                             f"用 colorplan.py --lr-model … 重新生成 stages.json）")
+        for e in fe:
+            lr = infos[e.name]["lr"]
+            extra = sorted(set(lr.get("tasks") or {}) - set(have))
+            if extra:
+                raise SystemExit(f"{e.name} 的 LR 会判出 {extra}，但这些 task 没有后段（有的是 {have}）")
+        needs_body = any(bool(infos[e.name]["lr"].get("needs_body")) for e in fe)
+        front_lr = True
+        models = sorted({infos[e.name]["lr"].get("model") for e in fe})
+        ident_desc = f"前段本机 LR（{', '.join(str(m) for m in models)}）"
+        print(f"前段本机识别：{ {e.name: infos[e.name]['lr'].get('classifier') for e in fe} }", flush=True)
+    elif a.mode in ("lr", "shadow"):
         from vllm.p2p.identifier import parse_tasks, use_p2p_framework
 
         use_p2p_framework(a.p2p_framework)
@@ -421,11 +446,13 @@ async def _amain(a) -> int:
         print(f"前段出口识别：{clf.describe()}；部署的 task 与先验 {tasks}", flush=True)
     co = TieredCoordinator(fe, be, bind="least", eos=eos, stop_ids=stop_ids, ignore_eos=False,
                            front_pick=a.front_pick, direct=not a.via_coordinator,
-                           classify=classify, route="lr" if a.mode == "lr" else "task")
+                           classify=classify, route="lr" if a.mode == "lr" else "task",
+                           front_lr=front_lr)
     co.start()
     app = make_app(co, stages=entries, tokenizer=tok, mode=a.mode,
                    max_model_len=a.max_model_len,
-                   needs_body=bool(clf is not None and clf.needs_body), identifier=ident_desc,
+                   needs_body=bool(clf is not None and clf.needs_body) or needs_body,
+                   identifier=ident_desc,
                    stream_timeout=a.stream_timeout)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -466,6 +493,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="oracle：按请求的 p2p_task 绑；lr：按前段出口识别的结果绑（B-1 目标形态）；"
                          "shadow：按 p2p_task 绑，只记识别结果")
     g = ap.add_argument_group("前段出口识别（--mode lr / shadow）")
+    g.add_argument("--lr-at", choices=("gateway", "front"), default="gateway",
+                   help="LR 在哪跑：gateway = 网关里（默认，前段交统计）；front = 各前段代理本机"
+                        "（含第 L₀ 层的卡，hf_overrides 里要有 p2p_lr），网关只用判定结果、不加载选择器")
     g.add_argument("--p2p-framework", default=None, help="p2p-framework 源码目录（默认自动找）")
     g.add_argument("--lr-model",
                    default="/home/ubuntu/p2p-framework/selector/selector_body_L8_params.npz")
