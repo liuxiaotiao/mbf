@@ -225,7 +225,7 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
-        # P2P B-1 分段引擎（vllm/p2p/stage.py）：None / "front" / "back"
+        # P2P B-1 分段引擎（vllm/p2p/stage.py）：None / "front" / "mid" / "back"
         self._init_p2p_stage(vllm_config)
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -790,8 +790,21 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
         )
         if self._p2p_pending:
-            scheduler_output.p2p_feed = self._p2p_pending
-            self._p2p_pending = {}
+            # runner 只能把 hidden 存给它已经认识的请求：本步排上的、或以前排上过的
+            # （num_computed_tokens > 0；被抢占的 runner 也还留着）。还没排上过的（刚 add、
+            # add 之前先到的那些行）留到它第一次被排上的那一步再送，否则 runner 会丢掉。
+            send, keep = {}, {}
+            for rid, rows in self._p2p_pending.items():
+                req = self.requests.get(rid)
+                if req is None or req.is_finished():
+                    continue
+                if rid in num_scheduled_tokens or req.num_computed_tokens > 0:
+                    send[rid] = rows
+                else:
+                    keep[rid] = rows
+            if send:
+                scheduler_output.p2p_feed = send
+            self._p2p_pending = keep
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -883,9 +896,9 @@ class Scheduler(SchedulerInterface):
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
             req_id = req.request_id
             req_ids.append(req_id)
-            # P2P B-1 前段不采样：输入 token 是协调器 p2p_append 进来的，runner 不知道，
-            # 和 PP 一样随调度结果送过去
-            if self.use_pp or self.p2p_role == "front":
+            # P2P B-1 前段 / 中段不采样：输入 token 是 p2p_append 进来的（中段是 p2p_feed
+            # 补的占位 token），runner 不知道，和 PP 一样随调度结果送过去
+            if self.use_pp or self.p2p_role in ("front", "mid"):
                 # When using PP, the scheduler sends the sampled tokens back,
                 # because there's no direct communication between the first-
                 # stage worker and the last-stage worker. Otherwise, we don't
@@ -1483,6 +1496,10 @@ class Scheduler(SchedulerInterface):
             p2p_stage.role_of(mc.hf_config) if mc is not None else None
         )
         self._p2p_pending: dict[str, list] = {}
+        # 中段 / 后段：请求还没 add 就先到的 hidden（上游代理直连发来，与协调器的 add 走两条
+        # 连接，先后没有保证）。add 时补上；abort 时丢掉；总数有上限。
+        self._p2p_early: dict[str, list] = {}
+        self._p2p_gone: dict[str, None] = {}   # 最近结束的请求号（有序，当 LRU 集合用）
         self._p2p_width = mc.get_hidden_size() if self.p2p_role else 0
         if self.p2p_role and self.scheduler_config.async_scheduling:
             raise ValueError(
@@ -1510,30 +1527,60 @@ class Scheduler(SchedulerInterface):
             n += 1
         return n
 
+    P2P_EARLY_MAX = 4096
+
     def p2p_feed(self, items: list) -> int:
-        """后段：[[req_id, pos, n, dtype, bytes], …] —— 前段算出的 [pos, pos+n) 的 hidden。"""
-        if self.p2p_role != "back":
-            raise RuntimeError("p2p_feed 只能发给后段引擎")
+        """中段 / 后段：[[req_id, pos, n, dtype, bytes], …] —— 上一段算出的 [pos, pos+n) 的 hidden。
+
+        中段不采样，序列靠这里长：收到的位置超过序列长度时补占位 token（输入 embedding 由
+        runner 换成收到的 hidden，token id 本身不参与计算）。"""
+        if self.p2p_role not in ("mid", "back"):
+            raise RuntimeError("p2p_feed 只能发给中段 / 后段引擎")
         n = 0
         for item in items:
             req_id, pos, rows = p2p_stage.unpack_rows(item, self._p2p_width)
             request = self.requests.get(req_id)
-            if request is None or request.is_finished():
+            if request is None:
+                if req_id in self._p2p_gone:
+                    continue                    # 已经结束（abort / 后段先停）
+                held = self._p2p_early.get(req_id)
+                if held is None and len(self._p2p_early) < self.P2P_EARLY_MAX:
+                    held = self._p2p_early[req_id] = []
+                if held is not None and len(held) < 256:
+                    held.append((pos, rows))
                 continue
-            assert request.p2p_ready is not None
-            request.p2p_ready = max(request.p2p_ready, pos + rows.shape[0])
-            self._p2p_pending.setdefault(req_id, []).append((pos, rows))
+            if request.is_finished():
+                continue
+            self._p2p_take_rows(request, pos, rows)
             n += 1
         return n
 
+    def _p2p_mark_gone(self, req_id: str) -> None:
+        self._p2p_gone.pop(req_id, None)
+        self._p2p_gone[req_id] = None
+        while len(self._p2p_gone) > self.P2P_EARLY_MAX:
+            self._p2p_gone.pop(next(iter(self._p2p_gone)))
+
+    def _p2p_take_rows(self, request: Request, pos: int, rows) -> None:
+        assert request.p2p_ready is not None
+        request.p2p_ready = max(request.p2p_ready, pos + rows.shape[0])
+        self._p2p_pending.setdefault(request.request_id, []).append((pos, rows))
+        if self.p2p_role == "mid" and request.p2p_ready > request.num_tokens:
+            request.append_output_token_ids(
+                [p2p_stage.PLACEHOLDER_TOKEN] * (request.p2p_ready - request.num_tokens))
+
     def add_request(self, request: Request) -> None:
-        if self.p2p_role == "back":
-            # 后段：prompt 的 hidden 随请求一起来（prompt_embeds），之后的位置要等 p2p_feed
+        if self.p2p_role in ("mid", "back"):
+            # 中段 / 后段：prompt 的 hidden 随请求一起来（prompt_embeds），之后的位置要等 p2p_feed
             request.p2p_ready = request.num_prompt_tokens
+            self._p2p_gone.pop(request.request_id, None)   # 请求号重用
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+        if self._p2p_early and (early := self._p2p_early.pop(request.request_id, None)):
+            for pos, rows in early:            # add 之前就到了的 hidden
+                self._p2p_take_rows(request, pos, rows)
 
     def finish_requests(
         self, request_ids: str | Iterable[str], finished_status: RequestStatus
@@ -1558,6 +1605,10 @@ class Scheduler(SchedulerInterface):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # Invalid request ID.
+                if self.p2p_role in ("mid", "back") and request is None:
+                    # P2P：abort 了还没 add 的请求 —— 丢掉先到的 hidden，之后的也不再收
+                    self._p2p_early.pop(req_id, None)
+                    self._p2p_mark_gone(req_id)
                 continue
 
             valid_requests.append(request)
@@ -1584,6 +1635,9 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        if self.p2p_role in ("mid", "back"):
+            # 结束了的请求号记一阵：之后才到的上游 hidden 直接丢，不当成「add 之前先到」
+            self._p2p_mark_gone(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 

@@ -123,8 +123,8 @@ class AgentBridge:
     协调器：发过 [H] 的那个对端（同一时刻只有一个协调器连着一个分段引擎）。引擎的输出都发给它。
 
     直连（`K_ROUTE`，协调器在绑定时下发）：每 token 的两样东西不再绕协调器 ——
-    * 前段代理：这条请求 prompt 之后位置的 hidden 直接 `p2p_feed` 给它的后段代理；
-      这些输出不再发给协调器（它只要 prompt 的 hidden 来做绑定）；路由还没到时先攒着。
+    * 前段 / 中段代理：这条请求 prompt 之后位置的 hidden 直接 `p2p_feed` 给路线上的下一段代理；
+      这些输出不再发给协调器（它只要 prompt 的 hidden 来做绑定 / 逐段 prefill）；路由还没到时先攒着。
     * 后段代理：这条请求新出的 token 直接 `p2p_append` 给它的前段代理；输出照常也发给协调器
       （流式给客户端、判结束）。
     别的代理发来的 [U] 不会被当成协调器。"""
@@ -219,6 +219,8 @@ class AgentBridge:
                     self.t_in[req.request_id] = time.perf_counter()
                     if req.prompt_token_ids is not None:
                         self.n_prompt[req.request_id] = len(req.prompt_token_ids)
+                    elif req.prompt_embeds is not None:          # 中段 / 后段
+                        self.n_prompt[req.request_id] = int(req.prompt_embeds.shape[0])
                     await self.client.add_request_async(req)
                 elif kind == K_ROUTE:
                     d = json.loads(bytes(body[0]))
@@ -278,7 +280,7 @@ class AgentBridge:
                 t = self.t_in.pop(rid, None)
                 if t is not None:
                     meta[rid] = round((now - t) * 1e3, 3)
-                if self.role == "front" and o.p2p_hidden is not None:
+                if self.role in ("front", "mid") and o.p2p_hidden is not None:
                     n0 = self.n_prompt.get(rid, 0)
                     end = o.p2p_pos + o.p2p_hidden.shape[0]
                     if rid in self.routes:
@@ -305,7 +307,7 @@ class AgentBridge:
                     self._drop(rid)
                 keep.append(o)
             for addr, items in direct.items():
-                await self._send_util(addr, "p2p_feed" if self.role == "front" else "p2p_append",
+                await self._send_util(addr, "p2p_append" if self.role == "back" else "p2p_feed",
                                       items)
             if self.peer is None or (not keep and not meta):
                 continue

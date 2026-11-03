@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""B1：一个分段引擎（前段 / 后段）在本机的代理。由 `launch.py --channels stages.json start …` 拉起。
+"""B1：一个分段引擎（前段 / 中段 / 后段）在本机的代理。由 `launch.py --channels stages.json start …` 拉起。
 
     # 后段 gsm8k-0：N03（node_rank 0，起 EngineCore + 代理）+ N05（node_rank 1，headless worker）
     VLLM_PP_LAYER_PARTITION=13,27 <venv>/bin/python -m vllm.p2p.stage_agent \\
@@ -41,9 +41,9 @@ def build_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--served-model-name", required=True, help="分段引擎名（launch 按它认进程）")
     ap.add_argument("--model", required=True)
-    ap.add_argument("--role", required=True, choices=("front", "back"))
+    ap.add_argument("--role", required=True, choices=("front", "mid", "back"))
     ap.add_argument("--layers", required=True, help="0-based 半开区间 lo,hi")
-    ap.add_argument("--task", default=None, help="后段服务的 task（只写进 /info）")
+    ap.add_argument("--task", default=None, help="中段 / 后段服务的 task（只写进 /info）")
     ap.add_argument("--pipeline-parallel-size", type=int, default=1)
     ap.add_argument("--nnodes", type=int, default=1)
     ap.add_argument("--node-rank", type=int, default=0)
@@ -71,7 +71,7 @@ def build_engine_args(a: argparse.Namespace):
     ov["p2p_stage"] = {"role": a.role, "layers": [lo, hi]}
     kw = dict(
         model=a.model, served_model_name=[a.served_model_name], dtype=a.dtype, hf_overrides=ov,
-        skip_tokenizer_init=True, enable_prompt_embeds=(a.role == "back"),
+        skip_tokenizer_init=True, enable_prompt_embeds=(a.role in ("mid", "back")),
         async_scheduling=False, enable_prefix_caching=False,
         gpu_memory_utilization=a.gpu_memory_utilization, max_model_len=a.max_model_len,
         pipeline_parallel_size=a.pipeline_parallel_size, enforce_eager=a.enforce_eager, seed=0)

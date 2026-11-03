@@ -433,6 +433,11 @@ def path_groups(doc: dict) -> tuple[dict, list]:
         for v in c.get("nodes") or []:
             if v not in by_task[t or "?"]:
                 by_task[t or "?"].append(v)
+    for name, c in (doc.get("mids") or {}).items():          # 多级：中段节点归到它的 task
+        t = c.get("task") or (str(name)[4:].rsplit("-", 1)[0] if str(name).startswith("mid-") else "?")
+        for v in c.get("nodes") or []:
+            if v not in by_task[t]:
+                by_task[t].append(v)
     fronts: list = []
     for r in rows:
         for v in str(r.get("front") or "").split("+"):

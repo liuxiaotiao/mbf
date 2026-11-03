@@ -48,9 +48,10 @@ model runner 里做（见 `stats.py`）。
 
 B-1 分段引擎（hf_overrides 里有 `p2p_stage` 才开）
 ----------------------------------------------
-`{"role": "front"|"back", "layers": [lo, hi]}`：本引擎只建 [lo, hi) 这些层（再按 PP 切给各级，
+`{"role": "front"|"mid"|"back", "layers": [lo, hi]}`：本引擎只建 [lo, hi) 这些层（再按 PP 切给各级，
 层号仍是全局的，权重按原名加载）。前段：final norm 换成 `AddResidual`（交出残差流）、没有
-lm_head；后段：embed_tokens 换成 `ZeroEmbed`（每个位置都由前段的 hidden 喂入）。
+lm_head；后段：embed_tokens 换成 `ZeroEmbed`（每个位置都由前段的 hidden 喂入）；中段两样都换
+（输入是上一段的 hidden、输出交给下一段）。
 协议与调度见 `vllm/p2p/stage.py`。
 
 逐专家核对
@@ -331,13 +332,16 @@ class Qwen3MoePartialForCausalLM(_q.Qwen3MoeForCausalLM):
                 self.lm_head = PPMissingLayer()
         if not pp.is_last_rank:
             self.model.norm = PPMissingLayer()
-        if stage is not None and stage.role == "front":
-            # 前段不出 logits：交出残差流（h + r），lm_head 不建
+        if stage is not None and stage.role in _p2p_stage.EMITS:
+            # 前段 / 中段不出 logits：交出残差流（h + r），lm_head 不建
             if pp.is_last_rank:
                 self.model.norm = _p2p_stage.AddResidual()
             self.lm_head = PPMissingLayer()
-        if stage is not None and stage.role == "back" and pp.is_first_rank:
-            if tied:
+        if stage is not None and stage.role == "mid" and not pp.is_first_rank:
+            # 中段不收 embed 权重（tie_word_embeddings 时上面没换掉，这里补上）
+            self.model.embed_tokens = PPMissingLayer()
+        if stage is not None and stage.role in _p2p_stage.FED and pp.is_first_rank:
+            if tied and stage.role == "back":
                 raise ValueError("后段不能用 tie_word_embeddings 的模型（lm_head 借的是 embed 权重）")
             self.model.embed_tokens = _p2p_stage.ZeroEmbed(
                 config.hidden_size, vllm_config.model_config.dtype)
@@ -383,7 +387,8 @@ class Qwen3MoePartialForCausalLM(_q.Qwen3MoeForCausalLM):
         stage = self.p2p_stage
         # 分段引擎换掉了的模块：checkpoint 里有，但本段不收（norm/lm_head 在后段，embed 在前段）
         skip = (() if stage is None else
-                ("model.norm.", "lm_head.") if stage.role == "front" else ("model.embed_tokens.",))
+                {"front": ("model.norm.", "lm_head."), "back": ("model.embed_tokens.",),
+                 "mid": ("model.norm.", "lm_head.", "model.embed_tokens.")}[stage.role])
 
         def localized():
             for name, w in weights:

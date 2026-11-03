@@ -225,9 +225,20 @@ def cmd_start(c: dict, user: str, env: dict[str, str], wait: float,
     # 显存预检：卡上已经有别的进程（上一次没停干净的 worker、识别服务、对拍……）时，vLLM 照样按
     # 「比例 × 整卡」算 KV，然后在预热时 OOM —— 报错只说 OOM，不说是谁占的。这里先查出来。
     busy = []
+    shared = c.get("shared_gpu") or {}
     for st in c["commands"]:
         g = parse_gpu(_ssh(st["host"], user, GPU_Q).stdout)
         if g["used_mb"] is not None and g["used_mb"] > 1024:
+            if st["node"] in shared and g["total_mb"]:
+                # 多级：这张卡本来就要放几个引擎（colorplan 已按比例分了显存）。只要剩下的够本引擎
+                # 的比例就放行；不够多半是别的东西占着
+                mine = float((c.get("gpu_mem") or {}).get(st["node"], 0.9))
+                free = 1.0 - g["used_mb"] / g["total_mb"]
+                ok = free >= mine
+                print(f"  {'·' if ok else '⚠'} {st['node']} 与 {shared[st['node']]} 同卡：已用 "
+                      f"{g['used_mb']}/{g['total_mb']} MiB，空闲 {free:.2f}，本引擎要 {mine:g}")
+                if ok:
+                    continue
             busy.append((st, g))
     if busy:
         print("  ⚠ 这些卡上已经有显存被占着（vLLM 按「比例 × 整卡」算 KV，不会扣掉别人的，"

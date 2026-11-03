@@ -36,6 +36,11 @@
   （OpenAI 兼容网关 + 协调器，bench / report / compare 原样可用；`--mode lr` = 前段出口识别：前段在
   prompt 算完时交出前 L₀ 层的路由统计（`stats.RouteStats.take_lr` → `EngineCoreOutput.p2p_feat`），
   协调器跑 LR 定 task、再绑该 task 最闲的后段，路径此后不变）。
+* 多级（中段，`role = mid`）：输入像后段、输出像前段、不采样（调度器在 p2p_feed 里补占位 token
+  让序列变长）。协调器绑定的是一条路线（`tiered.Route`：0 个或多个中段 + 1 个后段），逐段 prefill，
+  之后 hidden 一段段往下传，同 task 的多条路线可以分叉 / 汇合、按规划的 weight 分请求；
+  `kv_guard` 按 KV 容量预留，避免各段互相等死。清单由 `colorplan.py` 从
+  `moe_color_planner.py --deploy --interleave` 的结果生成（一张卡可以有几个引擎）。
 * `vllm/p2p/layer_bench.py` —— 各型 GPU 上「一层」的实测耗时（同一套 vLLM kernel、随机权重、
   两种层数相减），写进 p2p-framework 规划器的拓扑文件（节点的 `ms_per_layer`）。
 * `tests/p2p/` —— 以上各件的单测与端到端测试（假的 vLLM 通道，不要 GPU）。

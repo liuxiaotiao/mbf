@@ -172,6 +172,16 @@ class HFSource:
                 return hf_hub_download(repo_id=self.repo, filename=f, revision=self.revision,
                                        local_dir=dst_dir)
             except Exception as e:  # noqa: BLE001
+                if "xethub" in str(e) or "xet" in type(e).__module__.lower():
+                    # Xet 的 CAS 服务器连不上（部分子网实测如此）：之后都走普通 HTTPS 下载
+                    try:
+                        from huggingface_hub import constants as _hc
+                        if not _hc.HF_HUB_DISABLE_XET:
+                            _hc.HF_HUB_DISABLE_XET = True
+                            print(f"  Xet 连不上（{str(e)[:120]}），改走普通 HTTPS 重下", flush=True)
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
                 if k == attempts:
                     raise
                 wait = min(120, 15 * k)
@@ -198,6 +208,15 @@ class HFSource:
             time.sleep(min(60, 5 * k))
         os.replace(part, dst)
         return dst
+
+
+def _prune(d, extra, verified, nbytes, why):
+    for f in extra:
+        p = os.path.join(d, f)
+        if os.path.exists(p):
+            os.remove(p)
+        verified.pop(f, None)
+    print(f"[weights] {why}删掉用不到的 {len(extra)} 个分片，释放 {fmt_gb(nbytes)}", flush=True)
 
 
 def make_source(a):
@@ -373,14 +392,17 @@ def main(argv=None) -> int:
     todo = [s for s in shards if status[s] in ("missing", "bad_size")]
     need = sum(sizes.get(s) or 4_000_000_000 for s in todo)
     have = sum(os.path.getsize(os.path.join(d, s)) for s in shards if status[s] in ("ok", "unverified"))
-    free = shutil.disk_usage(d if os.path.isdir(d) else os.path.dirname(d) or "/").free
+    probe = d
+    while not os.path.isdir(probe) and os.path.dirname(probe) != probe:
+        probe = os.path.dirname(probe)               # 目录还没建：看最近的上级所在的盘
+    free = shutil.disk_usage(probe).free
     report = {"node": node, "host": socket.gethostname(), "dir": d, "source": src.label,
               "layers": spec.get("layers"), "embed": bool(spec.get("embed")), "head": bool(spec.get("head")),
               "n_tensors": n_tensors, "shards_needed": len(shards), "shards_total": len(all_shards),
               "status": status, "extra": extra, "extra_bytes": sum(os.path.getsize(os.path.join(d, f)) for f in extra),
               "stale": stale, "wrong_model": wrong, "need_bytes": need, "have_bytes": have,
               "needed_bytes": sum(sizes.get(s) or 0 for s in shards), "free_bytes": free,
-              "prune": prune,
+              "prune": prune, "sizes": sizes,
               "ok": not todo and not wrong and all(v == "ok" for v in status.values()) and not (prune and extra)}
     print(f"[weights] 要 {len(shards)}/{len(all_shards)} 个分片（{n_tensors} 个张量，"
           f"{fmt_gb(report['needed_bytes'])}）：已有 {sum(v == 'ok' for v in status.values())}、"
@@ -423,13 +445,8 @@ def main(argv=None) -> int:
         for s in [s for s in shards if status[s] == "bad_size"]:
             print(f"[weights] {s} 大小不对，删掉重下", flush=True)
             os.remove(os.path.join(d, s))
-        if prune:
-            for f in extra:
-                os.remove(os.path.join(d, f))
-                verified.pop(f, None)
-            if extra:
-                print(f"[weights] 删掉用不到的 {len(extra)} 个分片，释放 {fmt_gb(report['extra_bytes'])}", flush=True)
-            free = shutil.disk_usage(d).free
+        # 用不到的分片放到最后（要的都齐了）再删：下载失败时它们还在，别的节点可以从这里拷（weights.py 的
+        # 节点间互拷）；磁盘不够时才提前删
 
         def mark_verified(s):
             verified[s] = shas.get(s)
@@ -446,6 +463,10 @@ def main(argv=None) -> int:
                 os.remove(os.path.join(d, s))
                 todo.append(s)
                 need += sizes.get(s) or 4_000_000_000
+        if prune and extra and need + a.reserve_gb * 1e9 > free:
+            _prune(d, extra, verified, report["extra_bytes"], "磁盘不够，先")
+            extra = []
+            free = shutil.disk_usage(d).free
         if need + a.reserve_gb * 1e9 > free:
             raise SystemExit(f"磁盘不够：要 {fmt_gb(need)}（另留 {a.reserve_gb:g} GB），空闲 {fmt_gb(free)}")
         # 小文件（config / index / tokenizer …）：只补缺的，已有的不覆盖（本地 index 可能是部分 checkpoint
@@ -487,6 +508,10 @@ def main(argv=None) -> int:
         raise
     finally:
         shutil.rmtree(ref, ignore_errors=True)
+    if prune and extra:
+        _prune(d, extra, verified, report["extra_bytes"], "要的都齐了，")
+        with open(os.path.join(d, VERIFIED), "w", encoding="utf-8") as f:
+            json.dump(verified, f, indent=1)
     # index 改成只列本节点留下的分片：vLLM 只加载 index 里出现的分片文件，旧的完整 / 别人裁剪过的
     # index 与目录里实际的分片会对不上（留着用不到的分片时把它们也列进去）
     keep = set(shards) | (set() if prune else

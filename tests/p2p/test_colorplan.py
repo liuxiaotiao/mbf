@@ -198,3 +198,112 @@ def test_code_dir_prefixes_pythonpath(tmp_path):
     assert sj["color_plan"]["code_dir"] == "/home/ubuntu/mbf/"
     sj2, _ = _build(tmp_path)
     assert not sj2["channels"][0]["commands"][0]["cmd"].startswith("PYTHONPATH=")
+
+
+# --------------------------------------------------------------------------- #
+# 多级（moe_color_planner.py --deploy --interleave）：engines + routes → 中段 / 后段 / 路线
+# --------------------------------------------------------------------------- #
+def _multi_result():
+    """gsm8k：N01 切成两段（N01[9-20] 中段、N01[21-48] 后段），N02[9-20] 从 N01 的第 21 层进来；
+    mbpp：一条两级 PP 的后段 N03+N04；no_robots：单卡后段 N05。"""
+    res = _result()
+    dep = res["deploy"]
+    dep.update(interleave=True, backs=[])
+    dep["engines"] = [
+        {"name": "back-gsm8k-0", "role": "back", "task": "gsm8k", "nodes": ["N01"],
+         "layers": [[21, 48]], "weights_gb": [12.0], "kv_gb": [3.0], "tokens_per_s": 1000.0, "routes": 2},
+        {"name": "mid-gsm8k-0", "role": "mid", "task": "gsm8k", "nodes": ["N01"],
+         "layers": [[9, 20]], "weights_gb": [5.0], "kv_gb": [1.0], "tokens_per_s": 600.0, "routes": 1},
+        {"name": "mid-gsm8k-1", "role": "mid", "task": "gsm8k", "nodes": ["N02"],
+         "layers": [[9, 20]], "weights_gb": [5.0], "kv_gb": [1.0], "tokens_per_s": 400.0, "routes": 1},
+        {"name": "back-mbpp-0", "role": "back", "task": "mbpp", "nodes": ["N03", "N04"],
+         "layers": [[9, 28], [29, 48]], "weights_gb": [9.0, 9.0], "kv_gb": [2.0, 2.0],
+         "tokens_per_s": 1000.0, "routes": 1},
+        {"name": "back-no_robots-0", "role": "back", "task": "no_robots", "nodes": ["N05"],
+         "layers": [[9, 48]], "weights_gb": [17.0], "kv_gb": [3.0], "tokens_per_s": 1000.0, "routes": 1},
+    ]
+    dep["routes"] = [
+        {"task": "gsm8k", "engines": ["mid-gsm8k-0", "back-gsm8k-0"], "tokens_per_s": 600.0,
+         "share_of_task": 0.6, "avg_cycle_ms": 240.5, "weight": 144.3, "local_hops": 1},
+        {"task": "gsm8k", "engines": ["mid-gsm8k-1", "back-gsm8k-0"], "tokens_per_s": 400.0,
+         "share_of_task": 0.4, "avg_cycle_ms": 250.0, "weight": 100.0, "local_hops": 0},
+        {"task": "mbpp", "engines": ["back-mbpp-0"], "tokens_per_s": 1000.0, "share_of_task": 1.0,
+         "avg_cycle_ms": 235.0, "weight": 235.0, "local_hops": 0},
+        {"task": "no_robots", "engines": ["back-no_robots-0"], "tokens_per_s": 1000.0,
+         "share_of_task": 1.0, "avg_cycle_ms": 240.0, "weight": 240.0, "local_hops": 0},
+    ]
+    return res
+
+
+def _args(entry, rank=0):
+    toks = shlex.split(entry["commands"][rank]["cmd"].split(" --hf-overrides ")[0])
+    out = {}
+    for i, t in enumerate(toks):
+        if t.startswith("--") and i + 1 < len(toks) and not toks[i + 1].startswith("--"):
+            out[t] = toks[i + 1]
+    out["_env"] = {t.split("=")[0]: t.split("=", 1)[1] for t in toks if "=" in t and not t.startswith("-")}
+    return out
+
+
+def test_multi_level_plan_to_stages(tmp_path):
+    sj, notes = _build(tmp_path, res=_multi_result())
+    ch = {c["name"]: c for c in sj["channels"]}
+    assert sj["mids"] == ["mid-gsm8k-0", "mid-gsm8k-1"]
+    assert set(sj["backs"]) == {"back-gsm8k-0", "back-mbpp-0", "back-no_robots-0"}
+    # 路线：中段 + 后段，weight 取规划的（Little 定律的在飞数）
+    rts = {rt["name"]: rt for rt in sj["routes"]}
+    assert rts["mid-gsm8k-0 → back-gsm8k-0"]["hops"] == ["mid-gsm8k-0", "back-gsm8k-0"]
+    assert rts["mid-gsm8k-0 → back-gsm8k-0"]["weight"] == pytest.approx(144.3)
+    # 中段：角色 / 层（0-based 半开）/ 驻留专家只列本段的层
+    m0 = ch["mid-gsm8k-0"]
+    a = _args(m0)
+    assert a["--role"] == "mid" and a["--layers"] == "8,20" and m0["layers"] == [8, 20]
+    le = _overrides(m0)["p2p_layer_experts"]
+    assert set(le) == {str(l) for l in range(9, 20)}            # 第 9 层（0-based 8）装全，不列
+    b0 = ch["back-gsm8k-0"]
+    assert _args(b0)["--layers"] == "20,48"
+    # 同卡两个引擎：端口 / master_port 错开，显存按（权重 + KV + 1）比例分
+    assert m0["shared_gpu"] == {"N01": ["back-gsm8k-0"]} and b0["shared_gpu"] == {"N01": ["mid-gsm8k-0"]}
+    assert {_args(m0)["--port"], _args(b0)["--port"]} == {"8300", "8310"}
+    assert m0["zmq"] != b0["zmq"]
+    g_mid, g_back = m0["gpu_mem"]["N01"], b0["gpu_mem"]["N01"]
+    assert g_mid + g_back == pytest.approx(0.9, abs=2e-3)
+    assert g_mid / g_back == pytest.approx((5 + 1 + 1) / (12 + 3 + 1), rel=1e-2)
+    assert float(_args(m0)["--gpu-memory-utilization"]) == pytest.approx(g_mid)
+    assert any("N01 上有 2 个引擎" in s for s in notes)
+    # 不共卡的 mid-gsm8k-1 用槽 0、整卡比例
+    m1 = ch["mid-gsm8k-1"]
+    assert _args(m1)["--port"] == "8300" and m1["gpu_mem"] == {"N02": 0.9} and "shared_gpu" not in m1
+    # 两级 PP 的后段：同一个槽、切层
+    bm = ch["back-mbpp-0"]
+    assert bm["partition"] == [20, 20] and _args(bm, 1)["--node-rank"] == "1"
+    assert _args(bm)["_env"]["VLLM_PP_LAYER_PARTITION"] == "20,20"
+    # max_num_seqs：经过它的路线的 流量 × 循环时间 之和 × 1.3
+    assert b0["max_num_seqs"] >= (600 * 240.5 + 400 * 250) / 1e3 * 1.3
+
+
+def test_multi_level_weights_specs(tmp_path):
+    """weights.py 按节点合并：N01 上两个引擎 → 一份 spec，层 [8,20) + [20,48)，有 head、没有 embed。"""
+    w = _load("weights")
+    sj, _ = _build(tmp_path, res=_multi_result())
+    specs = w.node_specs(sj)
+    s1 = specs["N01"]["spec"]
+    assert sorted(map(tuple, s1["layers"])) == [(8, 20), (20, 48)]
+    assert s1["head"] and not s1["embed"]
+    assert not specs["N02"]["spec"]["head"] and not specs["N02"]["spec"]["embed"]
+    assert specs["N09"]["spec"]["embed"]
+
+
+def test_multi_level_rejects_bad_routes(tmp_path):
+    res = _multi_result()
+    res["deploy"]["routes"][0]["engines"] = ["back-gsm8k-0", "mid-gsm8k-0"]
+    with pytest.raises(cp.ColorPlanError, match="中段 \\+ 一个后段"):
+        _build(tmp_path, res=res)
+    res = _multi_result()
+    res["deploy"]["engines"][1]["layers"] = [[9, 48]]          # 中段不能到最后一层
+    with pytest.raises(cp.ColorPlanError, match="mid"):
+        _build(tmp_path, res=res)
+    res = _multi_result()
+    del res["deploy"]["routes"]
+    with pytest.raises(cp.ColorPlanError, match="routes"):
+        _build(tmp_path, res=res)

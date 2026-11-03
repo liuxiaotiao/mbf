@@ -395,6 +395,9 @@ def build_row(rec: Rec, *, mode: str, gw: Mapping | None, channels: Mapping[str,
                   (nodes[0] if nodes else "")),
         "back": ("+".join(gw["back_nodes"]) if gw.get("back_nodes") else "+".join(nodes[1:])),
         **({"front_engine": gw["front"]} if gw.get("front") else {}),
+        # 多级：路线上的中段引擎与节点
+        **({"mids": gw["mids"], "mid_nodes": "+".join(gw.get("mid_nodes") or []),
+            "route": gw.get("route")} if gw.get("mids") else {}),
         **({"tiered": {k: gw.get(k) for k in ("front_prefill_ms", "bind_ms")}}
            if gw.get("front_nodes") else {}),
         "channel": chname,
@@ -789,7 +792,8 @@ def main(argv: list[str] | None = None) -> int:
              for c in cj["channels"]}
     # 分段网关还有前段引擎（不属于任何「通道」）：它们的节点也要采 smi
     fronts_live = [f["name"] for f in gw_info.get("fronts") or []]
-    all_hosts = sorted({nh for c in (*live, *fronts_live) for nh in hosts.get(c, [])})
+    mids_live = [m["name"] for m in gw_info.get("mids") or []]       # 多级：中段引擎
+    all_hosts = sorted({nh for c in (*live, *fronts_live, *mids_live) for nh in hosts.get(c, [])})
     if caps and fronts_live:
         fcap = sum(int((channels.get(f) or {}).get("max_num_seqs") or 0) for f in fronts_live)
         if fcap and fcap < inflight:
@@ -964,6 +968,10 @@ def main(argv: list[str] | None = None) -> int:
                          "task": channels[c].get("task"),
                          "gpu_mem": channels[c].get("gpu_mem"),
                          "engine_metrics": mdelta.get(c)} for c in sorted(live)},
+        # 多级：中段引擎（按 task 归到各自的列；路线见 routes）
+        **({"mids": {m: {"nodes": channels[m]["nodes"], "task": channels[m].get("task"),
+                         "gpu_mem": channels[m].get("gpu_mem")} for m in mids_live if m in channels},
+            "routes": gw_info.get("routes")} if mids_live else {}),
         "requests": rows,
         "failed": failed,
         "summary": summarise(rows, mode),

@@ -691,8 +691,9 @@ class GPUModelRunner(
         # 后段 prompt 之后的每个位置用协调器送来的前段 hidden 作输入
         self._p2p_role = p2p_stage.role_of(self.model_config.hf_config)
         self._p2p_ext: dict[str, p2p_stage.RowBuffer] = {}
-        if self._p2p_role == "back" and not self.enable_prompt_embeds:
-            raise ValueError("P2P 后段引擎要 --enable-prompt-embeds（prompt 以 hidden 送入）")
+        # 中段 = 输入像后段、输出像前段
+        if self._p2p_role in p2p_stage.FED and not self.enable_prompt_embeds:
+            raise ValueError(f"P2P {self._p2p_role} 段引擎要 --enable-prompt-embeds（prompt 以 hidden 送入）")
         if self._p2p_role and self.use_async_scheduling:
             raise ValueError("P2P 分段引擎不支持 async scheduling：加 --no-async-scheduling")
 
@@ -957,8 +958,8 @@ class GPUModelRunner(
             reqs_to_add.append(req_state)
 
         # Update the states of the running/resumed requests.
-        # P2P 前段不采样，输入 token 由调度器随 new_token_ids 送来 —— 按非末级 PP 的路子收
-        is_last_rank = get_pp_group().is_last_rank and self._p2p_role != "front"
+        # P2P 前段 / 中段不采样，输入 token 由调度器随 new_token_ids 送来 —— 按非末级 PP 的路子收
+        is_last_rank = get_pp_group().is_last_rank and self._p2p_role not in p2p_stage.EMITS
         req_data = scheduler_output.scheduled_cached_reqs
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
 
@@ -3388,8 +3389,8 @@ class GPUModelRunner(
                 req_ids[:num_reqs], num_scheduled_tokens_np,
                 self.positions.np[:num_tokens_unpadded].copy(), self.requests)
 
-        if self._p2p_role == "front" and get_pp_group().is_last_rank:
-            # P2P 前段：不出 logits、不采样，交出每个被调度位置的残差流
+        if self._p2p_role in p2p_stage.EMITS and get_pp_group().is_last_rank:
+            # P2P 前段 / 中段：不出 logits、不采样，交出每个被调度位置的残差流
             return self._p2p_front_output(
                 model_output, num_scheduled_tokens_np, num_tokens_unpadded,
                 kv_connector_output)
@@ -4637,8 +4638,8 @@ class GPUModelRunner(
         if supports_mm_encoder_only(self.model):
             # MM Encoder only model no need to run sampler.
             return torch.tensor([])
-        if self._p2p_role == "front":
-            # P2P 前段没有 lm_head、从不采样
+        if self._p2p_role in p2p_stage.EMITS:
+            # P2P 前段 / 中段没有 lm_head、从不采样
             return torch.tensor([])
 
         hidden_states = torch.rand_like(hidden_states)

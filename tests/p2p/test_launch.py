@@ -158,3 +158,27 @@ def test_parse_gpu() -> None:
     assert g["apps"] == [(1234, 20000, "/home/ubuntu/venvs/vllm-p2p/bin/python3")]
     assert "spawn_main" in g["ps"][0]
     assert L.parse_gpu("")["used_mb"] is None
+
+
+def test_shared_gpu_engine_starts_when_its_share_is_free(monkeypatch, capsys) -> None:
+    """多级：同卡第二个引擎起的时候卡上已经有第一个引擎 —— 剩下的够它的比例就放行，不够才拦。"""
+    calls = []
+
+    def fake_ssh(host, user, script, timeout=60):
+        calls.append(script)
+        if script == L.GPU_Q:
+            return subprocess.CompletedProcess([], 0, stdout=f"{used[0]}, 24000\n---\n---\n", stderr="")
+        return subprocess.CompletedProcess([], 0, stdout="" if "pgrep" in script else "123", stderr="")
+
+    monkeypatch.setattr(L, "_ssh", fake_ssh)
+    c = {"name": "back-t-0", "api": "http://x:1/v1", "gpu_mem": {"N01": 0.5},
+         "shared_gpu": {"N01": ["mid-t-0"]},
+         "commands": [{"node": "N01", "host": "10.0.0.1", "cmd": "/v/bin/python -m x --hf-overrides {}"}]}
+    used = [9000]                       # 空闲 0.625 ≥ 0.5
+    assert L.cmd_start(c, "u", {}, wait=0) == 0
+    assert "同卡" in capsys.readouterr().out
+    used[0] = 15000                     # 空闲 0.375 < 0.5
+    assert L.cmd_start(c, "u", {}, wait=0) == 1
+    c2 = dict(c, shared_gpu={})         # 不是同卡的引擎：照旧拦
+    used[0] = 9000
+    assert L.cmd_start(c2, "u", {}, wait=0) == 1

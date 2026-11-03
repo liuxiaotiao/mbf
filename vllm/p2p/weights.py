@@ -18,6 +18,11 @@
 （已下 / 要下、百分比、速度、剩余时间、分片数、正在下的文件），与 Helix 的 `cluster_ctl.py weights` 同一种做法；
 Ctrl-C 只是不再等，重跑 `fetch` 会接着下（已下完、校验过的分片不重下）。各节点日志在 `--log-dir`。
 
+节点间互拷（默认开，`--no-peers` 关）：fetch 先核对全部节点，某台缺的分片如果别的节点上有（它要的、
+或它用不到但还没删的），先经控制机中转拷过去（`ssh 来源 cat | ssh 目标 cat`，不用节点之间的 ssh 信任），
+拷来的照常算 sha256；集群里没有的才从源下。用不到的分片要等本节点要的都齐了才删，下载失败时它们还在。
+HF 的 Xet 下载连不上时自动改走普通 HTTPS（也可以一开始就加 `--no-xet`）。
+
 下载源：默认 HuggingFace（控制机上的 HF_ENDPOINT / HF_TOKEN 会带到节点上，可以用镜像）；
 节点上没有外网时用 `--source dir:<目录>`（每台节点都能看到的完整 checkpoint，如 NFS）。
 """
@@ -261,6 +266,137 @@ def _select(nodes: dict, only: str | None) -> dict:
     return {v: i for v, i in nodes.items() if v in want}
 
 
+def collect_reports(nodes: dict, a) -> dict:
+    """各节点同时跑一遍只读核对 → {节点: 报告 dict 或错误文本}。"""
+    saved = getattr(a, "check_only", False)
+    a.check_only = True
+    script = NODE_SCRIPT.read_text(encoding="utf-8")
+    procs = {}
+    for v, i in nodes.items():
+        p = subprocess.Popen(_ssh_argv(a.user, i["host"], node_command(i, a)), stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            p.stdin.write(script)
+            p.stdin.close()
+        except BrokenPipeError:
+            pass
+        procs[v] = p
+    reports: dict = {}
+    t_end = time.time() + getattr(a, "timeout", 1800.0)
+    for v, p in procs.items():
+        try:
+            out, _ = p.communicate(timeout=max(1.0, t_end - time.time()))
+        except subprocess.TimeoutExpired:
+            p.kill()
+            reports[v] = "超时"
+            continue
+        line = next((ln for ln in out.splitlines() if ln.startswith(REPORT_MARK)), None)
+        reports[v] = (json.loads(line[len(REPORT_MARK):]) if line else
+                      (out.strip().splitlines() or ["没有输出"])[-1][:120])
+    a.check_only = saved
+    return reports
+
+
+# --------------------------------------------------------------------------- #
+# 节点间互拷：缺的分片先从集群里已经有它的节点拷（经控制机中转，不用节点之间的 ssh 信任），
+# 拷不到的才从 HF 下。拷来的分片在节点上是「待校验」，节点脚本照常算 sha256，不对就删掉重下。
+# --------------------------------------------------------------------------- #
+def plan_peer_copies(targets, reports: Mapping[str, object], *, reserve_gb: float = 2.0) -> tuple[list, list]:
+    """→ ([(目标, 分片, 来源, 字节数或 None)], [拷不到的 (目标, 分片)])。来源优先选 sha 已校验过的，
+    再选大小对的，再选「用不到」的那些；同一个来源尽量少分。目标磁盘放不下的不拷（交给 HF 下载）。"""
+    rank = {"ok": 0, "unverified": 1}
+    have: dict = {}
+    for v, r in reports.items():
+        if not isinstance(r, dict) or r.get("wrong_model"):
+            continue
+        for s, st in (r.get("status") or {}).items():
+            if st in rank:
+                have.setdefault(s, []).append((rank[st], v))
+        for s in r.get("extra") or ():
+            have.setdefault(s, []).append((2, v))
+    load: dict = {}
+    plan, none = [], []
+    for t in targets:
+        r = reports.get(t)
+        if not isinstance(r, dict) or r.get("wrong_model"):
+            continue
+        room = r.get("free_bytes", 0) - reserve_gb * 1e9
+        for s, st in sorted((r.get("status") or {}).items()):
+            if st not in ("missing", "bad_size"):
+                continue
+            cands = [(k, v) for k, v in have.get(s, []) if v != t]
+            size = (r.get("sizes") or {}).get(s)
+            if not cands:
+                none.append((t, s))
+                continue
+            if size and size > room:
+                none.append((t, s))
+                continue
+            k, v = min(cands, key=lambda kv: (kv[0], load.get(kv[1], 0), kv[1]))
+            load[v] = load.get(v, 0) + 1
+            room -= size or 4e9
+            plan.append((t, s, v, size))
+    return plan, none
+
+
+def peer_copy_cmds(wdir: str, shard: str) -> tuple[str, str]:
+    """（来源上执行的读命令, 目标上执行的写命令）；写到 .peer 再改名，失败不留半截。"""
+    src = shlex.quote(os.path.join(wdir, shard))
+    dst = shlex.quote(os.path.join(wdir, shard))
+    tmp = shlex.quote(os.path.join(wdir, shard + ".peer"))
+    return (f"cat -- {src}",
+            f"mkdir -p {shlex.quote(wdir)} && cat > {tmp} && mv -f {tmp} {dst} || {{ rm -f {tmp}; exit 1; }}")
+
+
+def run_peer_copies(plan: list, all_nodes: Mapping[str, dict], a) -> list:
+    """按计划拷（并发 a.peer_parallel 个，每个来源同时最多 2 个）→ 失败的 (目标, 分片)。"""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    sem = {v: threading.Semaphore(2) for v in {p[2] for p in plan}}
+    lock = threading.Lock()
+    done = {"n": 0, "bytes": 0}
+    failed = []
+    t0 = time.time()
+
+    def one(item):
+        t, s, v, size = item
+        rd, wr = peer_copy_cmds(a.dir, s)
+        with sem[v]:
+            t1 = time.time()
+            src = subprocess.Popen(_ssh_argv(a.user, all_nodes[v]["host"], rd), stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+            dst = subprocess.run(_ssh_argv(a.user, all_nodes[t]["host"], wr), stdin=src.stdout,
+                                 capture_output=True, text=True)
+            src.stdout.close()
+            src.wait()
+            ok = src.returncode == 0 and dst.returncode == 0
+            if ok and size:
+                chk = subprocess.run(_ssh_argv(a.user, all_nodes[t]["host"],
+                                               f"stat -c %s {shlex.quote(os.path.join(a.dir, s))}"),
+                                     capture_output=True, text=True)
+                ok = chk.stdout.strip() == str(size)
+            dt = time.time() - t1
+        with lock:
+            if ok:
+                done["n"] += 1
+                done["bytes"] += size or 0
+                print(f"  ✓ {s}  {v} → {t}  {(size or 0) / 1e9:.1f} GB，{dt:.0f}s"
+                      f"（{(size or 0) / max(dt, 1e-3) / 1e6:.0f} MB/s）  [{done['n']}/{len(plan)}]", flush=True)
+            else:
+                err = (src.stderr.read().decode("utf-8", "replace") if src.stderr else "") + dst.stderr
+                print(f"  ✗ {s}  {v} → {t}：{err.strip()[-200:] or '大小不对'}", flush=True)
+                failed.append((t, s))
+
+    print(f"节点间互拷 {len(plan)} 个分片（经控制机中转，同时 {a.peer_parallel} 个）…", flush=True)
+    with ThreadPoolExecutor(max_workers=max(1, a.peer_parallel)) as ex:
+        list(ex.map(one, plan))
+    dt = time.time() - t0
+    print(f"互拷完成 {done['n']}/{len(plan)}，{done['bytes'] / 1e9:.1f} GB，{dt:.0f}s"
+          f"（{done['bytes'] / max(dt, 1e-3) / 1e6:.0f} MB/s）", flush=True)
+    return failed
+
+
 def cmd_check(nodes: dict, a) -> int:
     a.check_only = True
     script = NODE_SCRIPT.read_text(encoding="utf-8")
@@ -295,10 +431,28 @@ def cmd_check(nodes: dict, a) -> int:
     return 0 if not bad else 1
 
 
-def cmd_fetch(nodes: dict, a) -> int:
+def cmd_fetch(nodes: dict, a, all_nodes: Mapping[str, dict] | None = None) -> int:
     a.check_only = False
     script_path = str(NODE_SCRIPT)
     os.makedirs(a.log_dir, exist_ok=True)
+    if a.peers and not a.clean:
+        pool = dict(all_nodes or nodes)
+        print(f"先核对 {len(pool)} 台节点上已有的分片（找能互拷的）…", flush=True)
+        reports = collect_reports(pool, a)
+        plan, none = plan_peer_copies(list(nodes), reports)
+        if plan:
+            failed = run_peer_copies(plan, pool, a)
+            if failed:
+                print(f"  {len(failed)} 个没拷成，交给下面的下载", flush=True)
+        else:
+            print("  集群里没有可以互拷的分片", flush=True)
+        if none:
+            by: dict = {}
+            for t, s in none:
+                by.setdefault(t, []).append(s)
+            print("  要从源下载（集群里没有 / 磁盘放不下）：" + "；".join(
+                f"{t} {len(ss)} 个" for t, ss in sorted(by.items())), flush=True)
+        a.check_only = False
     print(f"{len(nodes)} 台节点 → {a.dir}（源 {a.source}{'' if a.source != 'hf' else ' ' + a.repo}）"
           f"{'，先清空目录' if a.clean else ''}{'，留着用不到的分片' if a.keep_extra else '，删掉用不到的分片'}；"
           f"最多同时 {a.max_parallel} 台",
@@ -395,6 +549,9 @@ def main(argv=None) -> int:
                            help="留着本节点用不到的分片（默认删掉，各节点只留 mbf 要的）")
             p.add_argument("--clean", action="store_true", help="先清空各节点的整个权重目录")
             p.add_argument("--max-parallel", type=int, default=15)
+            p.add_argument("--no-peers", dest="peers", action="store_false",
+                           help="不先从集群里已有该分片的节点互拷（默认先互拷，拷不到的再从源下）")
+            p.add_argument("--peer-parallel", type=int, default=4, help="互拷同时几个分片（经控制机中转）")
             p.add_argument("--interval", type=float, default=10.0, help="进度表刷新间隔（秒）")
             p.add_argument("--log-dir", default="logs")
         if name == "status":
@@ -404,11 +561,12 @@ def main(argv=None) -> int:
     a.dir = a.dir or sj.get("model_dir")
     if not a.dir:
         raise SystemExit("清单里没有 model_dir，用 --dir 给")
-    nodes = _select(node_specs(sj), a.nodes)
+    all_nodes = node_specs(sj)
+    nodes = _select(all_nodes, a.nodes)
     if a.cmd == "check":
         return cmd_check(nodes, a)
     if a.cmd == "fetch":
-        return cmd_fetch(nodes, a)
+        return cmd_fetch(nodes, a, all_nodes)
     return cmd_status(nodes, a)
 
 

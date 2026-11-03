@@ -81,6 +81,150 @@ def _round_seqs(x: float, margin: float, floor: int = 16) -> int:
     return max(floor, int(math.ceil(x * margin / 8.0)) * 8)
 
 
+def _multi_engines(dep, inst, tasks_ex, hosts, *, l0, n_layers, bl, n_experts, python, model_dir,
+                   dtype, attention_backend, max_model_len, gpu_mem, gmn, port, master_port, eager,
+                   seqs_margin, back_max_num_seqs, agent_cmd, step_batch, check_batch, notes,
+                   front_nodes):
+    """多级（`--interleave` 规划）：规划的 engines → 中段 / 后段引擎条目，routes → 路线。
+
+    一张卡上可能有几个引擎（按进出点切出来的段）：
+    * 端口：同一台上第 s 个引擎用 port + 10·s（ZMQ = 它 + 1）、master_port + s；
+    * 显存：这张卡的 --gpu-mem 按各段规划的「权重 + KV」比例分给各引擎（`gpu_mem` 是每个引擎
+      自己的 --gpu-memory-utilization）；launch.py 逐个起、等前一个就绪再起下一个。"""
+    def addr(v):
+        return hosts[v].host
+
+    engines = list(dep["engines"])
+    by_name = {e["name"]: e for e in engines}
+    # 每台上的引擎（按起层）
+    on_node: dict[str, list] = {}
+    for e in engines:
+        for idx, v in enumerate(e["nodes"]):
+            on_node.setdefault(v, []).append((e["layers"][idx][0], e["name"], idx))
+    clash = sorted(set(on_node) & set(front_nodes))
+    if clash:
+        raise ColorPlanError(f"{clash} 既是前段卡又有中段 / 后段（规划结果不该这样）")
+    for v in on_node:
+        on_node[v].sort()
+    # 端口槽：同一个引擎在它的各台上用同一个槽，且与这些台上的其他引擎都不同
+    slot: dict[str, int] = {}
+    used: dict[str, set] = {}
+    for e in sorted(engines, key=lambda e: (e["layers"][0][0], e["name"])):
+        s = 0
+        while any(s in used.get(v, set()) for v in e["nodes"]):
+            s += 1
+        slot[e["name"]] = s
+        for v in e["nodes"]:
+            used.setdefault(v, set()).add(s)
+    # 显存：按规划的（权重 + KV）分
+    gm_of: dict[tuple[str, str], float] = {}
+    for v, lst in on_node.items():
+        tot = gmn.get(v, gpu_mem)
+        if len(lst) == 1:
+            gm_of[v, lst[0][1]] = tot
+            continue
+        need = []
+        for _, name, idx in lst:
+            e = by_name[name]
+            w = (e.get("weights_gb") or [None] * len(e["nodes"]))[idx]
+            kv = (e.get("kv_gb") or [None] * len(e["nodes"]))[idx]
+            need.append(1.0 if w is None else float(w) + float(kv or 0.0) + 1.0)
+        for (_, name, _), x in zip(lst, need):
+            gm_of[v, name] = round(tot * x / sum(need), 3)
+        notes.append(f"{v} 上有 {len(lst)} 个引擎（{', '.join(n for _, n, _ in lst)}），显存比例分成 "
+                     + " / ".join(f"{gm_of[v, n]:g}" for _, n, _ in lst)
+                     + "；launch.py start all 会逐个起（不要并行起同一张卡上的引擎）")
+    routes = []
+    for rt in dep["routes"]:
+        for h in rt["engines"]:
+            if h not in by_name:
+                raise ColorPlanError(f"路线 {rt['engines']} 里的 {h} 不在 engines 里")
+        last = by_name[rt["engines"][-1]]
+        if last["role"] != "back" or any(by_name[h]["role"] != "mid" for h in rt["engines"][:-1]):
+            raise ColorPlanError(f"路线 {rt['engines']}：要是若干中段 + 一个后段")
+        routes.append({"task": rt["task"], "hops": list(rt["engines"]),
+                       "weight": float(rt.get("weight") or rt["tokens_per_s"] * rt["avg_cycle_ms"] / 1e3)
+                       or 1.0, "tokens_per_s": rt["tokens_per_s"],
+                       "share_of_task": rt.get("share_of_task"), "avg_cycle_ms": rt["avg_cycle_ms"],
+                       "name": " → ".join(rt["engines"])})
+    mids, backs = [], []
+    for e in sorted(engines, key=lambda e: (e["role"] != "mid", e["task"] or "", e["name"])):
+        name, task, role = e["name"], e["task"], e["role"]
+        if task not in tasks_ex:
+            raise ColorPlanError(f"专家集合文件里没有 task {task!r}")
+        union = tasks_ex[task]["union"]
+        if len(union) != n_layers:
+            raise ColorPlanError(f"{task} 的专家集合有 {len(union)} 层，模型是 {n_layers} 层")
+        nodes = list(e["nodes"])
+        ranges = [_real_layers(lo, hi, bl) for lo, hi in e["layers"]]
+        for (v, (lo, hi)), (_, (lo2, _)) in zip(zip(nodes, ranges), zip(nodes[1:], ranges[1:])):
+            if lo2 != hi + 1:
+                raise ColorPlanError(f"{name}：{v} 到第 {hi} 层，下一级从第 {lo2} 层开始")
+        lo0, hi0 = ranges[0][0] - 1, ranges[-1][1]            # 0-based 半开
+        if lo0 < l0:
+            raise ColorPlanError(f"{name} 从第 {lo0 + 1} 层开始，在前段（前 {l0} 层）里")
+        if (role == "back") != (hi0 == n_layers):
+            raise ColorPlanError(f"{name} 是 {role}，却{'没' if role == 'back' else ''}到最后一层")
+        partition = [hi - lo + 1 for lo, hi in ranges]
+        le = {}
+        for l1 in range(lo0 + 1, hi0 + 1):
+            es = sorted(int(x) for x in union[l1 - 1])
+            if not es or es[0] < 0 or es[-1] >= n_experts or len(set(es)) != len(es):
+                raise ColorPlanError(f"{task} 第 {l1} 层的专家集合不合法")
+            if len(es) < n_experts:
+                le[str(l1 - 1)] = es
+        ov = {"architectures": [ARCH], "p2p_layer_experts": le, "p2p_miss_policy": "local_topk",
+              "p2p_channel": name}
+        mine = [rt for rt in routes if name in rt["hops"]]
+        conc = sum(rt["tokens_per_s"] * rt["avg_cycle_ms"] / 1e3 for rt in mine)
+        mns = (back_max_num_seqs if role == "back" and back_max_num_seqs
+               else _round_seqs(conc, seqs_margin))
+        sb = {}
+        for v, (lo, hi) in zip(nodes, ranges):
+            sb[v] = step_batch(v, e["tokens_per_s"], hi - lo + 1)
+            check_batch(name, v, sb[v])
+        s = slot[name]
+        p, mp = port + 10 * s, master_port + s
+        master = addr(nodes[0])
+        gms = {v: gm_of[v, name] for v in nodes}
+        shared = {v: [n for _, n, _ in on_node[v] if n != name] for v in nodes if len(on_node[v]) > 1}
+        ent = {
+            "name": name, "role": role, "task": task, "nodes": nodes, "layers": [lo0, hi0],
+            "partition": partition, "dtype": dtype, "gpu_mem": gms, "max_num_seqs": mns,
+            "api": f"http://{master}:{p}/v1", "zmq": f"tcp://{master}:{p + 1}",
+            "from_channels": [], **({"shared_gpu": shared} if shared else {}),
+            "plan": {"layers_1based": [list(r) for r in ranges], "tokens_per_s": e["tokens_per_s"],
+                     "routes": [rt["name"] for rt in mine],
+                     "share_of_task": round(sum(rt.get("share_of_task") or 0 for rt in mine), 4),
+                     "inflight_est": round(conc, 1),
+                     "step_batch_est": {v: None if x is None else round(x, 1) for v, x in sb.items()}},
+            "commands": [{"node": v, "host": addr(v), "cmd": agent_cmd(
+                python=python, name=name, model_dir=model_dir, role=role, layers=(lo0, hi0),
+                task=task, nodes=nodes, rank=r, master=master, master_port=mp,
+                partition=partition, dtype=dtype, max_model_len=max_model_len, gpu_mem=gms[v],
+                max_num_seqs=mns, attention_backend=attention_backend, port=p, overrides=ov,
+                eager=eager)} for r, v in enumerate(nodes)],
+        }
+        (mids if role == "mid" else backs).append(ent)
+    ent_of = {x["name"]: x for x in (*mids, *backs)}
+    for rt in routes:                       # 路线的层首尾相接：[L₀, …) → … → [.., n_layers)
+        prev = l0
+        for h in rt["hops"]:
+            lo, hi = ent_of[h]["layers"]
+            if lo != prev:
+                raise ColorPlanError(f"路线 {rt['name']}：{h} 从第 {lo + 1} 层开始，上一段到第 {prev} 层")
+            prev = hi
+        if prev != n_layers:
+            raise ColorPlanError(f"路线 {rt['name']} 只到第 {prev} 层")
+    for t in sorted({rt["task"] for rt in routes}):
+        mine = [rt for rt in routes if rt["task"] == t]
+        if len(mine) > 1 or any(len(rt["hops"]) > 1 for rt in mine):
+            notes.append(f"{t}：{len(mine)} 条路线 " + "；".join(
+                f"{' → '.join(rt['hops'])}（{(rt.get('share_of_task') or 0):.0%}，weight {rt['weight']:.1f}）"
+                for rt in mine))
+    return mids, backs, routes
+
+
 def stages_from_color_plan(
     res: Mapping, inst: Mapping, experts: Mapping, hosts: Mapping, *,
     model_dir: str, python: str, dtype: str = "half", attention_backend: str | None = "TRITON_ATTN",
@@ -114,7 +258,11 @@ def stages_from_color_plan(
     gmn = dict(gpu_mem_node or {})
     notes: list[str] = []
 
-    need = {f["node"] for f in dep["fronts"]} | {v for b in dep["backs"] for v in b["nodes"]}
+    multi = bool(dep.get("interleave")) and bool(dep.get("routes"))
+    if dep.get("interleave") and not dep.get("routes"):
+        raise ColorPlanError("--interleave 的结果里没有 routes / engines —— 用新版 moe_color_planner.py 重新求解")
+    need = ({f["node"] for f in dep["fronts"]} | {v for b in dep["backs"] for v in b["nodes"]}
+            | {v for e in dep.get("engines") or [] for v in e["nodes"]})
     miss = sorted(need - set(hosts))
     if miss:
         raise ColorPlanError(f"hosts 里没有 {miss} 的地址")
@@ -141,7 +289,8 @@ def stages_from_color_plan(
             raise ColorPlanError("前段本机 LR 要前段交出识别统计：不能同时 --no-front-lr")
         if not lr.get("model"):
             raise ColorPlanError("前段本机 LR 要给选择器路径（--lr-model）")
-        have = sorted({b["task"] for b in dep["backs"]})
+        have = sorted({b["task"] for b in dep["backs"]} |
+                      {e["task"] for e in dep.get("engines") or [] if e["role"] == "back"})
         tasks = dict(lr.get("tasks") or {t: 1.0 for t in have})
         extra = sorted(set(tasks) - set(have))
         if extra:
@@ -184,9 +333,19 @@ def stages_from_color_plan(
                 overrides=fov, eager=eager)}],
         })
 
+    if multi:
+        mids, backs, routes = _multi_engines(
+            dep, inst, tasks_ex, hosts, l0=l0, n_layers=n_layers, bl=bl, n_experts=n_experts,
+            python=python, model_dir=model_dir, dtype=dtype, attention_backend=attention_backend,
+            max_model_len=max_model_len, gpu_mem=gpu_mem, gmn=gmn, port=port,
+            master_port=master_port, eager=eager, seqs_margin=seqs_margin,
+            back_max_num_seqs=back_max_num_seqs, agent_cmd=agent_cmd, step_batch=step_batch,
+            check_batch=check_batch, notes=notes, front_nodes={f["node"] for f in dep["fronts"]})
+    else:
+        mids, routes = [], None
     # ---- 后段：每条流水线一个引擎 ----
     count: dict[str, int] = {}
-    for b in dep["backs"]:
+    for b in ([] if multi else dep["backs"]):
         task = b["task"]
         if task not in tasks_ex:
             raise ColorPlanError(f"专家集合文件里没有 task {task!r}")
@@ -259,7 +418,8 @@ def stages_from_color_plan(
     out = {
         "kind": "tiered", "plan": plan_path, "l0": l0, "n_layers": n_layers, "n_experts": n_experts,
         "model_dir": model_dir, "fronts": [f["name"] for f in fronts],
-        "backs": [b["name"] for b in backs], "channels": fronts + backs,
+        **({"mids": [m["name"] for m in mids], "routes": routes} if multi else {}),
+        "backs": [b["name"] for b in backs], "channels": fronts + mids + backs,
         "color_plan": {"via_coordinator": via, "coordinator": coord, "code_dir": code_dir,
                        "lr_at": "front" if lr_cfg else "gateway",
                        "gateway_cmd": " ".join(gw),
@@ -342,10 +502,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(json.dumps(sj, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"{len(sj['fronts'])} 个前段，{len(sj['backs'])} 个后段（L₀ = {sj['l0']}，共 {sj['n_layers']} 层）：")
+    nm = len(sj.get("mids") or [])
+    print(f"{len(sj['fronts'])} 个前段，{(str(nm) + ' 个中段，') if nm else ''}{len(sj['backs'])} 个后段"
+          f"（L₀ = {sj['l0']}，共 {sj['n_layers']} 层）：")
     for c in sj["channels"]:
         p = c["plan"]
-        extra = (f"  切层 {p['layers_1based']}  占该任务 {p['share_of_task']:.0%}" if c["role"] == "back" else "")
+        extra = (f"  切层 {p['layers_1based']}  占该任务 {p['share_of_task']:.0%}"
+                 if c["role"] in ("mid", "back") else "")
+        if c.get("shared_gpu"):
+            extra += f"  同卡：{c['shared_gpu']}"
         sb = ", ".join(f"{v} {x:.0f}" for v, x in (p.get("step_batch_est") or {}).items() if x is not None)
         print(f"  {c['name']:<22} {c['role']:<5} task={c['task'] or '—':<10} 节点 {'+'.join(c['nodes'])}"
               f"  规划 {p['tokens_per_s']:.0f} tokens/s，在飞 ≈ {p['inflight_est']:.0f}"
@@ -356,6 +521,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  引擎从 {a.code_dir} import vllm（命令前加了 PYTHONPATH）；各节点上要有这份代码（含编译好的 .so）")
     if sj["color_plan"]["lr_at"] == "front":
         print(f"  LR 选择器在各前段卡本机跑（{a.lr_model}）")
+    for rt in sj.get("routes") or []:
+        print(f"  路线 {rt['task']:<10} 前段 → {' → '.join(rt['hops'])}  {rt['tokens_per_s']:.0f} tokens/s，"
+              f"weight {rt['weight']:.1f}")
     print(f"已写 {a.out}\n拉起：python3 vllm/p2p/launch.py --channels {a.out} start all")
     print(f"网关：{sj['color_plan']['gateway_cmd'].replace('<本文件>', str(a.out))}")
     return 0

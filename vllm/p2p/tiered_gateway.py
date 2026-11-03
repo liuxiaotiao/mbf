@@ -188,7 +188,11 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
         def p50(xs):
             xs = sorted(xs)
             return round(xs[len(xs) // 2], 3) if xs else None
+        mids = res.get("mid_engine_ms") or {}
         return {"front": res.get("front"), "back": res.get("back"),
+                "mids": res.get("mids") or [], "route": res.get("route"),
+                "mid_engine_ms_p50": {k: p50(v) for k, v in mids.items()} or None,
+                "admit_wait_ms": res.get("admit_wait_ms"),
                 "front_prefill_ms": res.get("front_prefill_ms"), "bind_ms": res.get("bind_ms"),
                 "ttft_ms": res.get("ttft_ms"), "tpot_ms": res.get("tpot_ms"),
                 "front_leg_ms_p50": p50(res.get("front_leg_ms") or []),
@@ -220,9 +224,9 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
         if mode in ("oracle", "shadow"):
             if not task:
                 return bad(400, f"{mode} 模式要在请求里给 p2p_task", rec)
-            if not any(b.task == task for b in co.backs):
+            if not any(rt.task == task for rt in co.routes):
                 # 与 A 的网关一致：task 没有后段 → 立刻 503，不偷偷塞给别的 task 的后段
-                have = sorted({b.task for b in co.backs if b.task})
+                have = sorted({rt.task for rt in co.routes if rt.task})
                 return bad(503, f"task {task!r} 没有后段（有的是 {have}）", rec)
         if mode in ("lr", "shadow") and needs_body and not body_ranges:
             msg = ("识别器只数 body token —— 请求里要带 p2p_body（bench 用 p2p-framework 的 "
@@ -251,11 +255,17 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
             """第一个 token 出来时绑定早已发生：把前段 / 后段记进路由记录与响应头。"""
             back = req.back.name if req.back else None
             front = req.front.name if req.front else None
+            mids = [e.name for e in req.hops[1:-1]] if req.route is not None else []
             rec.update(channel=back, front=front, t_first_byte=time.time(), task=req.task,
                        front_nodes=list((stages.get(front) or {}).get("nodes", [])),
                        back_nodes=list((stages.get(back) or {}).get("nodes", [])))
+            if mids:                    # 多级：路线上的中段（及其节点）
+                rec.update(mids=mids, route=req.route.name,
+                           mid_nodes=[v for m in mids for v in (stages.get(m) or {}).get("nodes", [])])
             hdr.update({"X-P2P-Channel": back or "", "X-P2P-Front": front or "",
                         "X-P2P-Task": req.task or ""})
+            if mids:
+                hdr["X-P2P-Mids"] = ",".join(mids)
             v = req.info.get("verdict")
             if v is not None:
                 # bench 的 identify 列按 A4 识别服务的字段名读
@@ -349,7 +359,9 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
             # bench 把这些当「通道」：名字要能在 stages.json 里查到 task / 节点
             "channels": [{"name": b["name"], "task": b["task"], "inflight": b["inflight"],
                           "served": b["bound"]} for b in st["backs"]],
-            "fronts": st["fronts"]})
+            "fronts": st["fronts"], "mids": st.get("mids") or [],
+            "routes": st.get("routes") or [],
+            **({"kv": st["kv"], "parked": st["parked"]} if "kv" in st else {})})
 
     async def health(_):
         return web.json_response({"ok": True, "mode": mode, "kind": "tiered"})
@@ -374,17 +386,24 @@ async def _amain(a) -> int:
     from tokenizers import Tokenizer
 
     from vllm.p2p.remote import RemoteClient
-    from vllm.p2p.tiered import Engine, TieredCoordinator
+    from vllm.p2p.tiered import Engine, Route, TieredCoordinator
 
     sj = json.loads(Path(a.stages).read_text(encoding="utf-8"))
     entries = {c["name"]: c for c in sj["channels"]}
     fronts = [entries[n] for n in sj["fronts"]]
     backs = [entries[n] for n in sj["backs"]]
+    # 多级清单（colorplan.py 由 --interleave 规划生成）：中段 + 路线；没有 = 每个后段一条路线
+    routes_j = sj.get("routes") or [{"task": entries[n].get("task"), "hops": [n], "weight": 1.0}
+                                    for n in sj["backs"]]
     if a.only:
         want = {x.strip() for x in a.only.split(",") if x.strip()}
         backs = [b for b in backs if b["name"] in want or b["name"].removeprefix("back-") in want]
         if not backs:
             raise SystemExit(f"--only {a.only} 一个后段都没对上（有 {sj['backs']}）")
+        keep = {b["name"] for b in backs}
+        routes_j = [rt for rt in routes_j if rt["hops"][-1] in keep]
+    used_mids = {h for rt in routes_j for h in rt["hops"][:-1]}
+    mids = [entries[n] for n in sj.get("mids") or [] if n in used_mids]
     if a.fronts:
         want = {x.strip() for x in a.fronts.split(",") if x.strip()}
         fronts = [f for f in fronts if f["name"] in want or f["nodes"][0] in want]
@@ -393,7 +412,7 @@ async def _amain(a) -> int:
 
     engines = []
     infos: dict[str, dict] = {}
-    for c in (*fronts, *backs):
+    for c in (*fronts, *mids, *backs):
         cl = RemoteClient(c["zmq"])
         try:
             info = await cl.connect(timeout=a.connect_timeout, direct=not a.via_coordinator)
@@ -406,9 +425,35 @@ async def _amain(a) -> int:
               f"层 {info.get('layers')}  PP={info.get('pp')}  max_num_seqs {info.get('max_num_seqs')}"
               f"  {c['zmq']}", flush=True)
         infos[c["name"]] = info
-        engines.append(Engine(c["name"], c["role"], cl, task=c.get("task")))
+        kvb = info.get("kv_blocks")
+        engines.append(Engine(c["name"], c["role"], cl, task=c.get("task"),
+                              # KV 守卫：块池里有一块是 vLLM 留的空块，不算
+                              kv_blocks=int(kvb) - 1 if kvb else None,
+                              block_size=int(info.get("block_size") or 16)))
     fe = [e for e in engines if e.role == "front"]
     be = [e for e in engines if e.role == "back"]
+    by_name = {e.name: e for e in engines}
+    routes = [Route([by_name[h] for h in rt["hops"]], task=rt.get("task"),
+                    weight=float(rt.get("weight") or 1.0),
+                    name=rt.get("name") or " → ".join(rt["hops"])) for rt in routes_j]
+    # 路线的层要接得上：前段 [0, L₀) → 各段 [lo, hi) 首尾相接 → 最后一段到最后一层
+    n_layers = int(sj.get("n_layers") or 0)
+    l0s = {tuple(infos[e.name].get("layers") or ()) for e in fe}
+    for rt in routes:
+        prev = int(sj["l0"])
+        for e in rt.hops:
+            lo, hi = (int(x) for x in infos[e.name]["layers"])
+            if lo != prev:
+                raise SystemExit(f"路线 {rt.label}：{e.name} 从第 {lo} 层开始，上一段到第 {prev} 层"
+                                 f"（前段 {sorted(l0s)}）—— 清单与正在跑的引擎对不上")
+            prev = hi
+        if n_layers and prev != n_layers:
+            raise SystemExit(f"路线 {rt.label} 只到第 {prev} 层（模型 {n_layers} 层）")
+    kv_guard = a.kv_guard == "on" or (a.kv_guard == "auto" and bool(mids))
+    if kv_guard:
+        no_kv = [e.name for e in engines if e.kv_blocks is None]
+        if no_kv:
+            raise SystemExit(f"--kv-guard 要各引擎报 KV 块数，{no_kv} 没报（代理太旧？）")
     eos, stop_ids = load_stop_ids(a.model_dir)
     tok = Tokenizer.from_file(str(Path(a.model_dir) / "tokenizer.json"))
     classify, clf, ident_desc = None, None, None
@@ -447,7 +492,7 @@ async def _amain(a) -> int:
     co = TieredCoordinator(fe, be, bind="least", eos=eos, stop_ids=stop_ids, ignore_eos=False,
                            front_pick=a.front_pick, direct=not a.via_coordinator,
                            classify=classify, route="lr" if a.mode == "lr" else "task",
-                           front_lr=front_lr)
+                           front_lr=front_lr, routes=routes, kv_guard=kv_guard)
     co.start()
     app = make_app(co, stages=entries, tokenizer=tok, mode=a.mode,
                    max_model_len=a.max_model_len,
@@ -461,6 +506,13 @@ async def _amain(a) -> int:
           f"{'经协调器转' if a.via_coordinator else '前后段直连'}）：前段 {[e.name for e in fe]}，后段 "
           f"{ {u: [b.name for b in be if b.task == u] for u in sorted({b.task for b in be})} }；"
           f"停止 token {stop_ids}；监听 {a.host}:{a.port}", flush=True)
+    if mids or len(routes) != len(be):
+        print("多级路线（按 weight 分请求）：", flush=True)
+        for rt in routes:
+            print(f"  {rt.task:<10} 前段 → {rt.label}  weight {rt.weight:g}", flush=True)
+    if kv_guard:
+        print("KV 守卫：开（按 prompt + max_tokens 给每条请求在各段预留 KV 块，装不下就在网关排队；"
+              + "，".join(f"{e.name} {e.kv_blocks} 块" for e in engines) + "）", flush=True)
     try:
         await asyncio.Event().wait()
     finally:
@@ -487,6 +539,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--via-coordinator", action="store_true",
                     help="每 token 的 hidden / token 都经协调器转（默认前后段代理直连；"
                          "协调器与引擎不在同一网段时每跳多一个往返）")
+    ap.add_argument("--kv-guard", choices=("auto", "on", "off"), default="auto",
+                    help="KV 守卫：按各引擎的 KV 块数给每条请求预留最坏情况（prompt + max_tokens），"
+                         "装不下就在网关排队，各段都不会被抢占。auto（默认）= 有中段时开（多级时各段"
+                         "KV 都满会互相等死，vLLM 的抢占解不开）")
     ap.add_argument("--front-pick", choices=("speed", "least"), default="speed",
                     help="选前段：speed =（在飞+1）×实测每位置耗时最小（默认）；least = 在飞最少")
     ap.add_argument("--mode", choices=MODES, default="oracle",

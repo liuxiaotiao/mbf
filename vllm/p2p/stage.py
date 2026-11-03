@@ -12,7 +12,15 @@
 配置（`--hf-overrides` 写进 HF config，模型 / runner / 调度器都从这里读）：
 
     "p2p_stage": {"role": "front", "layers": [0, 8]}      # 0-based 半开区间
-    "p2p_stage": {"role": "back",  "layers": [8, 48]}
+    "p2p_stage": {"role": "mid",   "layers": [8, 22]}     # 可选：0 个或多个中段
+    "p2p_stage": {"role": "back",  "layers": [22, 48]}
+
+中段（多级）：输入像后段（prompt 的 hidden 随请求以 prompt_embeds 来，之后每个位置等上一段
+`p2p_feed`），输出像前段（不采样，交出残差流给下一段）。中段不知道 token：p2p_feed 收到的
+位置超过序列长度时，调度器补占位 token（`PLACEHOLDER_TOKEN`）让序列变长，runner 把这些位置的
+输入换成收到的 hidden。一个 token 的一生：
+
+    后段 token ─p2p_append─▶ 前段 ─p2p_feed─▶ 中段₁ ─p2p_feed─▶ … ─p2p_feed─▶ 后段
 
 两段之间传的是**残差流**：前段最后一层输出 (hidden, residual) 后不做 final norm，而是
 `hidden + residual`（`AddResidual`）；后段第一层收到 residual=None 时恰好做
@@ -37,16 +45,20 @@ from torch import nn
 
 __all__ = [
     "StageSpec", "stage_of", "role_of", "stage_layer_range", "AddResidual", "ZeroEmbed",
-    "RowBuffer", "pack_rows", "unpack_rows", "RowStream", "STAGE_KEY",
+    "RowBuffer", "pack_rows", "unpack_rows", "RowStream", "STAGE_KEY", "ROLES", "EMITS", "FED",
+    "PLACEHOLDER_TOKEN",
 ]
 
 STAGE_KEY = "p2p_stage"
-ROLES = ("front", "back")
+ROLES = ("front", "mid", "back")
+PLACEHOLDER_TOKEN = 0       # 中段补的占位 token（输入 embedding 会被换成上一段的 hidden）
+EMITS = ("front", "mid")    # 交出 hidden、不采样
+FED = ("mid", "back")       # 输入是上一段的 hidden（prompt_embeds + p2p_feed）
 
 
 @dataclass(frozen=True)
 class StageSpec:
-    role: str            # "front" | "back"
+    role: str            # "front" | "mid" | "back"
     lo: int              # 0-based，含
     hi: int              # 0-based，不含
 
@@ -82,11 +94,15 @@ def stage_of(cfg: Any, n_layers: int | None = None) -> StageSpec | None:
                              "lm_head 与 final norm 在后段")
     if role == "front" and lo != 0:
         raise ValueError(f"前段必须从第 0 层开始（lo={lo}）：embed_tokens 在前段")
+    if role in FED and lo == 0:
+        raise ValueError(f"{role} 段不能从第 0 层开始：第 0 层的输入是 token（在前段）")
+    if role == "mid" and n_layers is not None and hi >= n_layers:
+        raise ValueError(f"中段不能到最后一层（hi={hi}，模型 {n_layers} 层）：最后一层在后段")
     return StageSpec(role, lo, hi)
 
 
 def role_of(cfg: Any) -> str | None:
-    """'front' / 'back' / None。调度器与 runner 用它决定走不走分段逻辑。"""
+    """'front' / 'mid' / 'back' / None。调度器与 runner 用它决定走不走分段逻辑。"""
     st = stage_of(cfg)
     return st.role if st else None
 

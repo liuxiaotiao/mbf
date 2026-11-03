@@ -267,3 +267,80 @@ def test_progress_table_speed_and_eta():
     assert tot["done"] == pytest.approx(4e9) and tot["speed"] == pytest.approx(3e8)   # 3 GB / 10 s
     assert "下载中" in text and "50" in text and "model-00003-of-00016" in text and "连不上" in text
     assert prev["N01"] == (100.0, 5e9)
+
+
+def test_plan_peer_copies_prefers_verified_and_spreads_donors():
+    rep = lambda st, extra=(), free=100e9, sizes=None, wrong=None: {          # noqa: E731
+        "status": st, "extra": list(extra), "free_bytes": free, "sizes": sizes or {}, "wrong_model": wrong}
+    reports = {
+        "A": rep({"s1": "missing", "s2": "missing", "s3": "missing"}, sizes={"s1": 4e9, "s2": 4e9, "s3": 4e9}),
+        "B": rep({"s1": "unverified"}, extra=["s2"]),
+        "C": rep({"s1": "ok", "s2": "ok"}),
+        "D": rep({"s3": "ok"}, wrong="config 不对"),           # 模型不对的不当来源
+        "E": "超时",
+    }
+    plan, none = W.plan_peer_copies(["A"], reports)
+    got = {s: v for _, s, v, _ in plan}
+    assert got == {"s1": "C", "s2": "B"} or got == {"s1": "C", "s2": "C"}
+    assert got["s1"] == "C"                                  # sha 校验过的优先
+    assert none == [("A", "s3")]
+    # 磁盘放不下的不拷，交给下载
+    reports["A"]["free_bytes"] = 6.5e9
+    plan, none = W.plan_peer_copies(["A"], reports)
+    assert len(plan) == 1 and ("A", "s3") in none and len(none) == 2
+
+
+def _per_host_ssh(tmp_path):
+    """假 ssh：每台「主机」一个根目录（命令里的权重目录换成 <tmp>/<主机>/w），在本机执行。"""
+    f = tmp_path / "fake_ssh_hosts"
+    w = str(tmp_path / "w")
+    f.write_text(f"#!{sys.executable}\n"
+                 "import os, re, sys\n"
+                 "host = sys.argv[1].split('@')[-1]\n"
+                 f"cmd = re.sub(re.escape({w!r}) + r'(?=[/\\s\\'\"]|$)', {str(tmp_path)!r} + '/' + host + '/w', sys.argv[2])\n"
+                 "os.execvp('bash', ['bash', '-c', cmd])\n")
+    f.chmod(f.stat().st_mode | stat.S_IEXEC)
+    return str(f)
+
+
+def test_fetch_copies_between_nodes_before_downloading(tmp_path, monkeypatch, capsys):
+    """N03 要的 s4 源里没有（模拟 HF 下不动），但 N02 上有（它用不到）：先互拷给 N03，N02 再删掉；
+    N01 要的 s1 集群里没有，从源下。拷来的分片照常校验。"""
+    src = _source(tmp_path)
+    s4 = (src / "s4.safetensors").read_bytes()
+    sj = _stages(tmp_path)
+    for c in sj["channels"]:
+        for st in c["commands"]:
+            st["cmd"] = st["cmd"].replace("/venv/bin/python", sys.executable)
+    sp = tmp_path / "stages.json"
+    sp.write_text(json.dumps(sj))
+    monkeypatch.setattr(W, "SSH", [_per_host_ssh(tmp_path)])
+    base = ["--stages", str(sp), "--source", f"dir:{src}"]
+    # N02（h2）：要的 s2、s3 齐了，还有用不到的 s4
+    assert W.main(["fetch", *base, "--nodes", "N02", "--keep-extra", "--interval", "0.1",
+                   "--log-dir", str(tmp_path / "logs")]) == 0
+    (tmp_path / "h2" / "w" / "s4.safetensors").write_bytes(s4)
+    (src / "s4.safetensors").unlink()                         # 源里拿不到 s4 了
+    capsys.readouterr()
+    rc = W.main(["fetch", *base, "--interval", "0.1", "--log-dir", str(tmp_path / "logs")])
+    out = capsys.readouterr().out
+    assert "节点间互拷" in out and "s4.safetensors  N02 → N03" in out
+    assert rc == 0, out
+    names = lambda h: sorted(p.name for p in (tmp_path / h / "w").glob("*.safetensors"))  # noqa: E731
+    assert names("h1") == ["s1.safetensors"]                  # N01：从源下
+    assert names("h2") == ["s2.safetensors", "s3.safetensors"]   # N02：s4 拷走后才删
+    assert names("h3") == ["s4.safetensors"]                  # N03：从 N02 拷来
+    assert (tmp_path / "h3" / "w" / "s4.safetensors").read_bytes() == s4
+    assert not list((tmp_path / "h3" / "w").glob("*.peer"))
+
+
+def test_failed_download_keeps_extra_shards(tmp_path):
+    """下载失败时用不到的分片还在（别的节点还能从这里拷）；成功后才删。"""
+    src = _source(tmp_path)
+    dst = tmp_path / "w"
+    dst.mkdir()
+    (dst / "s1.safetensors").write_bytes(b"\x01" * 1000)      # 用不到
+    (src / "s3.safetensors").unlink()                         # 要的 s3 下不到
+    with pytest.raises(BaseException):
+        _run(tmp_path, dst)
+    assert (dst / "s1.safetensors").exists()
