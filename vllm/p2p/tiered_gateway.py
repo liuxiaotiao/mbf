@@ -410,6 +410,19 @@ async def _amain(a) -> int:
         if not fronts:
             raise SystemExit(f"--fronts {a.fronts} 一个前段都没对上（有 {sj['fronts']}）")
 
+    # 先占住 HTTP 端口再去连引擎：端口被占（比如已经有一个网关在跑）就在这里退出 —— 连上引擎的握手
+    # 会把各代理的「协调器」换成这一个，之后才退出的话，引擎的输出就都发给了已经不在的网关
+    import socket as _socket
+    lsock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    lsock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    try:
+        lsock.bind((a.host, a.port))
+    except OSError as e:
+        raise SystemExit(f"端口 {a.host}:{a.port} 被占用（{e}）—— 已经有网关在跑？"
+                         f"`ss -ltnp | grep :{a.port}` 看是谁；没连任何引擎，正在跑的那个不受影响") from None
+    lsock.listen(1024)
+    lsock.setblocking(False)
+
     engines = []
     infos: dict[str, dict] = {}
     for c in (*fronts, *mids, *backs):
@@ -501,7 +514,7 @@ async def _amain(a) -> int:
                    stream_timeout=a.stream_timeout)
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, a.host, a.port).start()
+    await web.SockSite(runner, lsock).start()
     print(f"分段网关（{a.mode}，前段按 {a.front_pick} 挑，"
           f"{'经协调器转' if a.via_coordinator else '前后段直连'}）：前段 {[e.name for e in fe]}，后段 "
           f"{ {u: [b.name for b in be if b.task == u] for u in sorted({b.task for b in be})} }；"

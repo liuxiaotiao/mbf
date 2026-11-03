@@ -790,3 +790,37 @@ def test_b0_script_with_mid_stages(configs, tmp_path, monkeypatch, capsys) -> No
         if role == "mid":
             assert json.loads(le) == {}
     assert "按路线" in text and "B0 正确性：✓" in text
+
+
+def test_agent_aborts_orphans_when_a_new_coordinator_connects(configs) -> None:
+    """第二个协调器接入（比如又起了一个网关）：上一个协调器 add 进来、还没结束的请求被收掉。"""
+    pytest.importorskip("zmq")
+    from vllm.p2p.remote import AgentBridge, RemoteClient
+    from vllm.p2p.tiered import _core_request
+
+    async def go():
+        core = FakeCore(make_sched(configs["front"], 64), FrontRunner(), 1)
+        core._ensure()
+        port = 29000 + random.Random().randrange(900)
+        br = AgentBridge(core, f"tcp://127.0.0.1:{port}", {"name": "f", "role": "front"})
+        run = asyncio.get_running_loop().create_task(br.run())
+        c1, c2 = RemoteClient(f"tcp://127.0.0.1:{port}"), RemoteClient(f"tcp://127.0.0.1:{port}")
+        try:
+            await c1.connect(timeout=5)
+            await c1.add_request_async(_core_request(
+                "warm0", prompt=[5, 6, 7], embeds=None, max_tokens=4, eos=None, logprobs=0,
+                ignore_eos=True, stop_ids=(), arrival=0.0))
+            await c1.get_output_async()                       # 前段 prefill 完、停在那里
+            assert "warm0" in core.sched.requests and br.owned == {"warm0"}
+            await c2.connect(timeout=5)
+            await asyncio.sleep(0.2)
+            return core, br
+        finally:
+            run.cancel()
+            core.close()
+            c1.shutdown()
+            c2.shutdown()
+
+    core, br = asyncio.run(go())
+    assert core.aborted == ["warm0"] and not br.owned
+    assert not core.sched.requests

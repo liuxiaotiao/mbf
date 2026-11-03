@@ -161,6 +161,7 @@ class AgentBridge:
         self.held: dict[str, list] = {}
         self._peers: dict[str, object] = {}
         self.direct = False             # 协调器握手时说的：它会不会下发直连路由
+        self.owned: set[str] = set()    # 协调器 add 进来、还没结束 / abort 的请求
 
     async def _err(self, msg: str) -> None:
         if self.peer is not None:
@@ -182,6 +183,7 @@ class AgentBridge:
             [K_UTIL, *self.enc.encode((method, [items]))], copy=False)
 
     def _drop(self, rid: str) -> None:
+        self.owned.discard(rid)
         self.routes.pop(rid, None)
         self.n_prompt.pop(rid, None)
         self.held.pop(rid, None)
@@ -209,6 +211,16 @@ class AgentBridge:
             self.n_in += 1
             try:
                 if kind == K_HELLO:
+                    if self.peer is not None and sender != self.peer and self.owned:
+                        # 换了一个协调器：上一个留下的请求没人管了（它不会再 abort），在这里收掉，
+                        # 免得它们一直占着引擎的位置和 KV、请求号也和新协调器的撞上
+                        stale = sorted(self.owned)
+                        self.owned.clear()
+                        for rid in stale:
+                            self._drop(rid)
+                        await self.client.abort_requests_async(stale)
+                        print(f"[agent] 新协调器接入：收掉上一个协调器留下的 {len(stale)} 条请求",
+                              flush=True)
                     self.peer = sender
                     hello = json.loads(bytes(body[0])) if body else {}
                     self.direct = bool(hello.get("direct"))
@@ -216,6 +228,7 @@ class AgentBridge:
                         [self.peer, K_INFO, json.dumps(self.info).encode("utf-8")])
                 elif kind == K_ADD:
                     req = self.dec_req.decode(body)
+                    self.owned.add(req.request_id)
                     self.t_in[req.request_id] = time.perf_counter()
                     if req.prompt_token_ids is not None:
                         self.n_prompt[req.request_id] = len(req.prompt_token_ids)
