@@ -280,6 +280,8 @@ def collect_reports(nodes: dict, a) -> dict:
             p.stdin.close()
         except BrokenPipeError:
             pass
+        # 已经关了：不让 communicate() 再去 flush（Python 3.10 会抛 ValueError: I/O operation on closed file）
+        p.stdin = None
         procs[v] = p
     reports: dict = {}
     t_end = time.time() + getattr(a, "timeout", 1800.0)
@@ -409,6 +411,8 @@ def cmd_check(nodes: dict, a) -> int:
             p.stdin.close()
         except BrokenPipeError:
             pass
+        # 已经关了：不让 communicate() 再去 flush（Python 3.10 会抛 ValueError: I/O operation on closed file）
+        p.stdin = None
         procs[v] = p
     reports: dict = {}
     print(f"核对 {len(nodes)} 台节点的 {a.dir}（源 {a.source}{'' if a.source != 'hf' else ' ' + a.repo}）…", flush=True)
