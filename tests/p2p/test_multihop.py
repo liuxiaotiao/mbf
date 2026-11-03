@@ -824,3 +824,43 @@ def test_agent_aborts_orphans_when_a_new_coordinator_connects(configs) -> None:
     core, br = asyncio.run(go())
     assert core.aborted == ["warm0"] and not br.owned
     assert not core.sched.requests
+
+
+@pytest.mark.parametrize("role", ["mid", "back"])
+def test_stage_stress_driver(configs, role) -> None:
+    """单卡压测脚本（vllm/p2p/stage_stress.py）的驱动：真调度器 + 假 runner，保持在飞、按位置喂、
+    跑完的收掉换新的，最后调度器里干干净净。"""
+    from vllm.p2p.stage_stress import StressDriver
+    from vllm.p2p.tiered import Engine
+
+    async def go():
+        core = FakeCore(make_sched(configs[role], 64), MidRunner(1) if role == "mid" else BackRunner(), 3)
+        drv = StressDriver(Engine("x", role, core), role=role, hidden=W, concurrency=6,
+                           prompt_range=(3, 20), steps_range=(2, 9), seed=1)
+        try:
+            res = await drv.run(max_requests=20, report_every=1e9)
+        finally:
+            core.close()
+        await asyncio.sleep(0.05)
+        return res, core
+
+    res, core = asyncio.run(go())
+    assert res["added"] == 20 and res["done"] == 20 and res["bad_rows"] == 0
+    assert res["rows"] > 0 and res["fed"] > 0
+    assert not core.sched.requests
+
+
+def test_stage_stress_plan_from_stages(tmp_path) -> None:
+    from vllm.p2p.stage_stress import plan_from_stages
+
+    sj = json.loads((ROOT / "p2p_channels" / "stages_color.json").read_text()) \
+        if (ROOT / "p2p_channels" / "stages_color.json").exists() else None
+    if sj is None:
+        pytest.skip("没有 p2p_channels/stages_color.json")
+    p = plan_from_stages(sj, "N07")
+    assert p["engine"] == "back-gsm8k-0" and p["role"] == "mid" and p["layers"] == (22, 35)
+    assert all(22 <= int(k) < 35 for k in p["experts"])
+    p = plan_from_stages(sj, "N08")
+    assert p["role"] == "back" and p["layers"][1] == 48
+    with pytest.raises(SystemExit, match="前段"):
+        plan_from_stages(sj, "N03")
