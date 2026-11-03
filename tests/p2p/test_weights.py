@@ -113,11 +113,18 @@ def test_check_fetch_repair_prune(tmp_path):
     _, _, rep = _run(tmp_path, dst, "--check")
     assert rep["status"]["s3.safetensors"] == "bad_size" and rep["extra"] == ["s1.safetensors"]
     assert rep["stale"] == ["s4.safetensors.part"] and not rep["ok"]
-    rc, _, _ = _run(tmp_path, dst)                            # 修复：重下坏的；用不到的默认留着
+    rc, _, _ = _run(tmp_path, dst, "--keep-extra")            # 留着用不到的：重下坏的、清残留
     assert rc == 0 and (dst / "s3.safetensors").stat().st_size == 3000
     assert (dst / "s1.safetensors").exists() and not (dst / "s4.safetensors.part").exists()
-    rc, _, _ = _run(tmp_path, dst, "--prune")
+    idx = json.loads((dst / "model.safetensors.index.json").read_text())["weight_map"]
+    assert set(idx.values()) == {"s1.safetensors", "s2.safetensors", "s3.safetensors"}
+    rc, _, _ = _run(tmp_path, dst)                            # 默认：用不到的删掉，index 只列留下的
     assert rc == 0 and not (dst / "s1.safetensors").exists()
+    idx = json.loads((dst / "model.safetensors.index.json").read_text())["weight_map"]
+    assert set(idx.values()) == {"s2.safetensors", "s3.safetensors"}
+    assert idx == {n: s_ for n, s_ in WEIGHT_MAP.items() if s_ in ("s2.safetensors", "s3.safetensors")}
+    _, _, rep = _run(tmp_path, dst, "--check")
+    assert rep["ok"] and rep["extra"] == []
 
 
 def test_wrong_model_is_wiped_and_redownloaded(tmp_path):
@@ -131,8 +138,33 @@ def test_wrong_model_is_wiped_and_redownloaded(tmp_path):
     _, _, rep = _run(tmp_path, dst, "--check")
     assert "num_experts 8≠4" in rep["wrong_model"] and set(rep["status"].values()) == {"missing"}
     rc, text, _ = _run(tmp_path, dst)
-    assert rc == 0 and "清空" in text and not (dst / "other.bin").exists()
+    assert rc == 0 and "模型不对" in text
+    assert (dst / "other.bin").exists()                       # 不是本脚本管的文件：不动
     assert json.loads((dst / "config.json").read_text())["num_experts"] == 4
+    assert (dst / "s2.safetensors").read_bytes() == b"\x02" * 2000 and (dst / "s3.safetensors").exists()
+
+
+def test_partial_checkpoint_index_is_not_wrong_and_not_overwritten(tmp_path):
+    _source(tmp_path)
+    dst = tmp_path / "w"
+    dst.mkdir()
+    (dst / "config.json").write_text(json.dumps(CONFIG))
+    sub = {n: s for n, s in WEIGHT_MAP.items() if s == "s2.safetensors"}     # 只列自己有的张量
+    (dst / "model.safetensors.index.json").write_text(json.dumps({"weight_map": sub}))
+    (dst / "s2.safetensors").write_bytes(b"\x02" * 2000)
+    _, _, rep = _run(tmp_path, dst, "--check")
+    assert rep["wrong_model"] is None and rep["status"] == {"s2.safetensors": "ok", "s3.safetensors": "missing"}
+    rc, _, _ = _run(tmp_path, dst)
+    assert rc == 0 and (dst / "s3.safetensors").exists()
+    # index 改成列出目录里留下的分片（新下的 s3 也在里面，否则 vLLM 不会加载它）
+    idx = json.loads((dst / "model.safetensors.index.json").read_text())["weight_map"]
+    assert set(idx.values()) == {"s2.safetensors", "s3.safetensors"}
+    # 张量指向别的分片：不是同一种切分 → 判不对
+    bad = dict(sub)
+    bad[next(iter(bad))] = "s9.safetensors"
+    (dst / "model.safetensors.index.json").write_text(json.dumps({"weight_map": bad}))
+    _, _, rep = _run(tmp_path, dst, "--check")
+    assert "所在分片不同" in rep["wrong_model"]
 
 
 def test_disk_space_guard(tmp_path):
@@ -207,6 +239,8 @@ def test_check_and_fetch_end_to_end(tmp_path, monkeypatch, capsys):
     sp.write_text(json.dumps(sj))
     monkeypatch.setattr(W, "SSH", [_fake_ssh(tmp_path)])
     base = ["--stages", str(sp), "--nodes", "N02", "--source", f"dir:{tmp_path / 'hub'}"]
+    (tmp_path / "w").mkdir()
+    (tmp_path / "w" / "s4.safetensors").write_bytes(b"\x04" * 4000)   # 用不到的：fetch 时删
     assert W.main(["check", *base]) == 1
     out = capsys.readouterr().out
     assert "N02" in out and "要下载" in out
@@ -214,6 +248,7 @@ def test_check_and_fetch_end_to_end(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "各节点权重下载进度" in out and "完成" in out and "全部节点就绪" in out
     assert sorted(p.name for p in (tmp_path / "w").glob("*.safetensors")) == ["s2.safetensors", "s3.safetensors"]
+    assert "删掉用不到的分片" in out
     assert W.main(["check", *base]) == 0 and "就绪" in capsys.readouterr().out
     assert W.main(["status", "--stages", str(sp), "--nodes", "N02"]) == 0
     assert "完成" in capsys.readouterr().out

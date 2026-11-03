@@ -13,8 +13,8 @@
   驻留专家（命令里 hf_overrides 的 `p2p_layer_experts`）；流水线末级再加 final norm + lm_head。
 
 `fetch` 在所有节点上同时跑 `weights_node.py`（脚本经 ssh 的标准输入送过去，节点上不用同步代码）：
-模型不对 → 清空重下；要的分片缺了 / 大小不对 / sha256 不对 → 删掉重下；用不到的分片默认留着，
-`--prune` 才删（权重目录常与 p2p-framework 共用）。下载中每 `--interval` 秒刷新一张进度表
+模型不对 → 删掉权重分片与模型文件、重下；要的分片缺了 / 大小不对 / sha256 不对 → 删掉重下；
+用不到的分片删掉（各节点只留 mbf 要的；`--keep-extra` 留着）；最后 index 改成只列留下的分片。下载中每 `--interval` 秒刷新一张进度表
 （已下 / 要下、百分比、速度、剩余时间、分片数、正在下的文件），与 Helix 的 `cluster_ctl.py weights` 同一种做法；
 Ctrl-C 只是不再等，重跑 `fetch` 会接着下（已下完、校验过的分片不重下）。各节点日志在 `--log-dir`。
 
@@ -121,7 +121,7 @@ def node_command(info: dict, a) -> str:
     py = a.python or info.get("python") or "python3"
     args = ["--dir", a.dir, "--spec", _encode(info["spec"]), "--source", a.source,
             "--repo", a.repo, "--revision", a.revision]
-    for flag, on in (("--prune", getattr(a, "prune", False)), ("--clean", getattr(a, "clean", False)),
+    for flag, on in (("--keep-extra", getattr(a, "keep_extra", False)), ("--clean", getattr(a, "clean", False)),
                      ("--no-verify", a.no_verify), ("--curl", a.curl), ("--no-xet", a.no_xet)):
         if on:
             args.append(flag)
@@ -235,6 +235,8 @@ def print_check_table(nodes: Mapping[str, dict], reports: Mapping[str, dict | st
             verdict = "要下载"
         elif unv:
             verdict = "要校验 sha256"
+        elif r["extra"] and r.get("prune", True):
+            verdict = "要删用不到的分片"
         else:
             verdict = "就绪"
         if verdict != "就绪":
@@ -243,7 +245,7 @@ def print_check_table(nodes: Mapping[str, dict], reports: Mapping[str, dict | st
         print(f"  {v:<5} {info['engine'][:20]:<20} {lay:<12} {r['shards_needed']:>4}/{r['shards_total']:<3}"
               f" {ok:>5} {unv:>6} {miss:>6} {r['need_bytes'] / 1e9:>7.1f}GB {extra:>12}"
               f" {r['free_bytes'] / 1e9:>7.0f}GB  {verdict}", file=file)
-    print("  层后缀：·E = 还要 embed_tokens，·H = 还要 final norm + lm_head；「用不到」的分片 fetch --prune 才删",
+    print("  层后缀：·E = 还要 embed_tokens，·H = 还要 final norm + lm_head；「用不到」的分片 fetch 时删掉（--keep-extra 留着）",
           file=file, flush=True)
     return bad
 
@@ -298,7 +300,8 @@ def cmd_fetch(nodes: dict, a) -> int:
     script_path = str(NODE_SCRIPT)
     os.makedirs(a.log_dir, exist_ok=True)
     print(f"{len(nodes)} 台节点 → {a.dir}（源 {a.source}{'' if a.source != 'hf' else ' ' + a.repo}）"
-          f"{'，先清空目录' if a.clean else ''}{'，删掉用不到的分片' if a.prune else ''}；最多同时 {a.max_parallel} 台",
+          f"{'，先清空目录' if a.clean else ''}{'，留着用不到的分片' if a.keep_extra else '，删掉用不到的分片'}；"
+          f"最多同时 {a.max_parallel} 台",
           flush=True)
     queue = list(nodes)
     running: dict = {}
@@ -388,7 +391,8 @@ def main(argv=None) -> int:
                            help="每台节点核对的时限（秒；要算 sha256 的分片多时会久一点）")
             p.add_argument("--json", default=None, help="把各节点的核对结果写成 JSON")
         if name == "fetch":
-            p.add_argument("--prune", action="store_true", help="删掉本节点用不到的分片")
+            p.add_argument("--keep-extra", action="store_true",
+                           help="留着本节点用不到的分片（默认删掉，各节点只留 mbf 要的）")
             p.add_argument("--clean", action="store_true", help="先清空各节点的整个权重目录")
             p.add_argument("--max-parallel", type=int, default=15)
             p.add_argument("--interval", type=float, default=10.0, help="进度表刷新间隔（秒）")

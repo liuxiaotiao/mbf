@@ -6,7 +6,7 @@
 也可以手动跑：
 
     python weights_node.py --dir /home/ubuntu/p2p-framework/weights-q3-30b --spec <base64 JSON> --check
-    python weights_node.py --dir … --spec … [--prune] [--source hf|dir:/nfs/qwen3-30b] [--curl] [--no-xet]
+    python weights_node.py --dir … --spec … [--keep-extra] [--source hf|dir:/nfs/qwen3-30b] [--curl] [--no-xet]
 
 spec（`weights.py` 按 stages.json 算好、base64 后传进来）::
 
@@ -20,11 +20,15 @@ embed_tokens，后段末级的 model.norm 与 lm_head（与 `qwen3_moe_partial.p
 
 核对（`--check` 只报告，不改动）与修复（默认）：
 
-* **模型不对**：本地 config.json / model.safetensors.index.json 与源（HF 或 --source dir:）不一致
-  （模型类型、层数、专家数、hidden、权重表）→ 清空目录、整套重下；
+* **模型不对**：本地 config.json 与源（HF 或 --source dir:）的模型类型 / 层数 / 专家数 / hidden 不同，
+  或本地 index 里有源没有的张量、同一张量在不同的分片 → 删掉目录里的权重分片与模型文件（config / index /
+  tokenizer、本脚本的记录、下载残留），**其余文件不动**，再整套重下。本地 index 只是源的子集
+  （部分 checkpoint）不算不对；
+* 已有的 config / index / tokenizer 不覆盖（只补缺的）；
 * **要的分片**：不在 → 下载；大小不对或 sha256 不对 → 删掉重下；大小对、还没校验过的 → 算一次
   sha256（结果记在 `.p2p_weights_verified.json`，以后不再算）；
-* **用不到的分片**：报告出来；加 `--prune` 才删（权重目录常与 p2p-framework 共用，默认不删）；
+* **用不到的分片**：删掉（目录里只留 mbf 在这台节点上要的；`--keep-extra` 留着）；
+* 最后把 model.safetensors.index.json 改成只列留下的分片（vLLM 只加载 index 里出现的分片文件）；
 * 残留的 `*.part` / `*.incomplete`：下载前清掉。
 
 下载过程写 `<dir>/.p2p_weights_progress.json`（控制机据此画进度表）；成功时最后打印 P2P_WEIGHTS_OK，
@@ -226,6 +230,25 @@ def dir_size(d: str) -> int:
     return tot
 
 
+def managed(name: str) -> bool:
+    """本脚本管的文件：权重分片、模型的小文件、本脚本的记录、下载残留。别的文件不碰。"""
+    return (name.endswith((".safetensors", ".part", ".incomplete")) or name in SMALL_FILES
+            or name.startswith(".p2p_weights") or name in ("generation_config.json", "special_tokens_map.json"))
+
+
+def clean_managed(d: str) -> int:
+    """「模型不对」时用：只删本脚本管的文件（分片、config / index / tokenizer、记录），其余原样留着。"""
+    freed = 0
+    if not os.path.isdir(d):
+        return 0
+    for name in os.listdir(d):
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and managed(name):
+            freed += os.path.getsize(p)
+            os.remove(p)
+    return freed
+
+
 def clean_dir(d: str) -> int:
     real = os.path.realpath(d)
     home = os.path.realpath(os.path.expanduser("~"))
@@ -264,8 +287,14 @@ def identity_problem(local_dir: str, ref_dir: str) -> str | None:
     diff = [k for k in ID_KEYS if lc.get(k) != rc.get(k)]
     if diff:
         return "config.json 与源不同：" + ", ".join(f"{k} {lc.get(k)}≠{rc.get(k)}" for k in diff)
-    if li.get("weight_map") != ri.get("weight_map"):
-        return "model.safetensors.index.json 的权重表与源不同"
+    lw, rw = li.get("weight_map") or {}, ri.get("weight_map") or {}
+    # 本地 index 是源的子集（部分 checkpoint 只列了自己有的张量）没问题；张量在源里没有、
+    # 或同一个张量指向不同的分片文件，才说明不是同一个模型 / 同一种切分
+    unknown = [n for n in lw if n not in rw]
+    moved = [n for n in lw if n in rw and lw[n] != rw[n]]
+    if unknown or moved:
+        return (f"index 与源不一致：{len(unknown)} 个张量源里没有、{len(moved)} 个张量所在分片不同"
+                f"（如 {(unknown or moved)[0]}）")
     return None
 
 
@@ -282,7 +311,9 @@ def main(argv=None) -> int:
     ap.add_argument("--repo", default="Qwen/Qwen3-30B-A3B")
     ap.add_argument("--revision", default="main")
     ap.add_argument("--check", action="store_true", help="只核对、报告，不改动任何文件")
-    ap.add_argument("--prune", action="store_true", help="删掉本节点用不到的分片")
+    ap.add_argument("--keep-extra", action="store_true",
+                    help="留着本节点用不到的分片（默认删掉：目录里只留 mbf 在这台节点上要的）")
+    ap.add_argument("--prune", action="store_true", help=argparse.SUPPRESS)   # 旧参数，现在是默认行为
     ap.add_argument("--clean", action="store_true", help="先清空整个目录")
     ap.add_argument("--no-verify", action="store_true", help="不算 sha256（只比大小）")
     ap.add_argument("--curl", action="store_true", help="用 curl 下载（可续传）")
@@ -291,6 +322,7 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if a.no_xet:
         os.environ["HF_HUB_DISABLE_XET"] = "1"
+    prune = not a.keep_extra
     spec = json.loads(base64.b64decode(a.spec).decode("utf-8"))
     node = spec.get("node") or socket.gethostname()
     d = os.path.abspath(os.path.expanduser(a.dir))
@@ -348,12 +380,14 @@ def main(argv=None) -> int:
               "status": status, "extra": extra, "extra_bytes": sum(os.path.getsize(os.path.join(d, f)) for f in extra),
               "stale": stale, "wrong_model": wrong, "need_bytes": need, "have_bytes": have,
               "needed_bytes": sum(sizes.get(s) or 0 for s in shards), "free_bytes": free,
-              "ok": not todo and not wrong and all(v == "ok" for v in status.values())}
+              "prune": prune,
+              "ok": not todo and not wrong and all(v == "ok" for v in status.values()) and not (prune and extra)}
     print(f"[weights] 要 {len(shards)}/{len(all_shards)} 个分片（{n_tensors} 个张量，"
           f"{fmt_gb(report['needed_bytes'])}）：已有 {sum(v == 'ok' for v in status.values())}、"
           f"待校验 {sum(v == 'unverified' for v in status.values())}、大小不对 "
           f"{sum(v == 'bad_size' for v in status.values())}、缺 {sum(v == 'missing' for v in status.values())}"
-          f"（要下 {fmt_gb(need)}）；用不到的 {len(extra)} 个（{fmt_gb(report['extra_bytes'])}）；"
+          f"（要下 {fmt_gb(need)}）；用不到的 {len(extra)} 个（{fmt_gb(report['extra_bytes'])}，"
+          f"{'留着' if a.keep_extra else 'fetch 时删掉'}）；"
           f"空闲 {fmt_gb(free)}" + (f"\n[weights] 模型不对：{wrong} → 清空重下" if wrong else ""), flush=True)
     if a.check:
         print(f"{REPORT_MARK} {json.dumps(report, ensure_ascii=False)}", flush=True)
@@ -372,9 +406,14 @@ def main(argv=None) -> int:
         os.replace(tmp, os.path.join(d, PROGRESS))
 
     try:
-        if a.clean or wrong:
+        if a.clean:
             freed = clean_dir(d)
-            print(f"[weights] 清空 {d}，释放 {fmt_gb(freed)}", flush=True)
+            print(f"[weights] 清空 {d}（--clean），释放 {fmt_gb(freed)}", flush=True)
+            verified, free = {}, shutil.disk_usage(d).free
+        elif wrong:
+            freed = clean_managed(d)
+            print(f"[weights] 模型不对：删掉 {d} 里的权重分片与模型文件（其余文件不动），释放 {fmt_gb(freed)}",
+                  flush=True)
             verified, free = {}, shutil.disk_usage(d).free
         save_progress()
         for f in stale:
@@ -384,7 +423,7 @@ def main(argv=None) -> int:
         for s in [s for s in shards if status[s] == "bad_size"]:
             print(f"[weights] {s} 大小不对，删掉重下", flush=True)
             os.remove(os.path.join(d, s))
-        if a.prune:
+        if prune:
             for f in extra:
                 os.remove(os.path.join(d, f))
                 verified.pop(f, None)
@@ -409,8 +448,11 @@ def main(argv=None) -> int:
                 need += sizes.get(s) or 4_000_000_000
         if need + a.reserve_gb * 1e9 > free:
             raise SystemExit(f"磁盘不够：要 {fmt_gb(need)}（另留 {a.reserve_gb:g} GB），空闲 {fmt_gb(free)}")
-        # 小文件（config / index / tokenizer …）：从源同步一份
+        # 小文件（config / index / tokenizer …）：只补缺的，已有的不覆盖（本地 index 可能是部分 checkpoint
+        # 自己的版本，别的程序在用；模型不对 / --clean 时前面已经删掉，这里会重新拿）
         for f in SMALL_FILES:
+            if os.path.exists(os.path.join(d, f)):
+                continue
             try:
                 src.fetch_small(f, d)
             except Exception as e:  # noqa: BLE001
@@ -445,9 +487,18 @@ def main(argv=None) -> int:
         raise
     finally:
         shutil.rmtree(ref, ignore_errors=True)
+    # index 改成只列本节点留下的分片：vLLM 只加载 index 里出现的分片文件，旧的完整 / 别人裁剪过的
+    # index 与目录里实际的分片会对不上（留着用不到的分片时把它们也列进去）
+    keep = set(shards) | (set() if prune else
+                          {f for f in os.listdir(d) if f.endswith(".safetensors") and f in set(wm.values())})
+    sub = {n: sh for n, sh in wm.items() if sh in keep}
+    tmp = os.path.join(d, "model.safetensors.index.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"metadata": index.get("metadata", {}), "weight_map": sub}, f, indent=2)
+    os.replace(tmp, os.path.join(d, "model.safetensors.index.json"))
     save_progress(state="done", current=None)
     with open(os.path.join(d, MANIFEST), "w", encoding="utf-8") as f:
-        json.dump({"source": src.label, "spec": spec, "shards": shards, "pruned": bool(a.prune),
+        json.dump({"source": src.label, "spec": spec, "shards": shards, "pruned": prune,
                    "time": time.strftime("%F %T")}, f, indent=1, ensure_ascii=False)
     print(f"[weights] 完成，用时 {time.time() - t0:.0f}s；{len(shards)} 个分片在 {d}", flush=True)
     print(OK_MARK, flush=True)
