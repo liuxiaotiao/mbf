@@ -184,3 +184,17 @@ def test_step_batch_far_from_plan_batch_is_flagged(tmp_path):
     res["deploy"]["backs"][0]["tokens_per_s"] = 5000.0     # 5000 × 20 层 × 3.6 ms = 360 条/步
     _, notes = _build(tmp_path, res=res)
     assert any("back-gsm8k-0" in s and "N01" in s and "偏大" in s for s in notes)
+
+
+def test_code_dir_prefixes_pythonpath(tmp_path):
+    sj, _ = _build(tmp_path, code_dir="/home/ubuntu/mbf/")
+    for c in sj["channels"]:
+        for stc in c["commands"]:
+            assert stc["cmd"].startswith("PYTHONPATH=/home/ubuntu/mbf ")
+            toks = shlex.split(stc["cmd"].split(" --hf-overrides ")[0])
+            assert "/venv/bin/python" in toks                  # launch.py 仍能认出 venv
+    b = next(c for c in sj["channels"] if c["role"] == "back")
+    assert "VLLM_PP_LAYER_PARTITION=" in b["commands"][0]["cmd"]
+    assert sj["color_plan"]["code_dir"] == "/home/ubuntu/mbf/"
+    sj2, _ = _build(tmp_path)
+    assert not sj2["channels"][0]["commands"][0]["cmd"].startswith("PYTHONPATH=")

@@ -88,12 +88,19 @@ def stages_from_color_plan(
     port: int = 8300, master_port: int = 29600, front_lr: bool = True, eager: bool = False,
     seqs_margin: float = 1.3, front_max_num_seqs: int | None = None,
     back_max_num_seqs: int | None = None, plan_path: str | None = None,
-    lr: Mapping | None = None,
+    lr: Mapping | None = None, code_dir: str | None = None,
 ) -> tuple[dict, list[str]]:
     """`lr`：前段本机 LR 的配置（写进前段 hf_overrides 的 `p2p_lr`），至少有 `model`；
-    `tasks` 不给就用后段覆盖到的 task、先验各 1。"""
+    `tasks` 不给就用后段覆盖到的 task、先验各 1。
+    `code_dir`：节点上这份代码的目录。给了就在每条命令前加 `PYTHONPATH=<目录>`，引擎从它 import vllm
+    （venv 的可编辑安装仍指向别的源码目录、不想动它时用）。"""
     """→ (stages.json 的内容, 提示)。"""
     st = _load_sibling("stages")
+    _agent = st.agent_command
+
+    def agent_cmd(**kw) -> str:
+        cmd = _agent(**kw)
+        return f"PYTHONPATH={code_dir.rstrip('/')} {cmd}" if code_dir else cmd
     dep = res.get("deploy")
     if not dep:
         raise ColorPlanError("结果里没有 deploy 段 —— 要用 moe_color_planner.py --deploy 求解")
@@ -169,7 +176,7 @@ def stages_from_color_plan(
             "plan": {"tokens_per_s": fr["tokens_per_s"], "avg_cycle_ms": fr.get("avg_cycle_ms"),
                      "inflight_est": round(conc, 1),
                      "step_batch_est": {v: None if fb is None else round(fb, 1)}},
-            "commands": [{"node": v, "host": addr(v), "cmd": st.agent_command(
+            "commands": [{"node": v, "host": addr(v), "cmd": agent_cmd(
                 python=python, name=name, model_dir=model_dir, role="front", layers=(0, l0),
                 task=None, nodes=[v], rank=0, master=addr(v), master_port=master_port,
                 partition=None, dtype=dtype, max_model_len=max_model_len, gpu_mem=gm,
@@ -226,7 +233,7 @@ def stages_from_color_plan(
                      "share_of_task": b["share_of_task"], "avg_cycle_ms": b["avg_cycle_ms"],
                      "inflight_est": round(conc, 1),
                      "step_batch_est": {v: None if x is None else round(x, 1) for v, x in sb.items()}},
-            "commands": [{"node": v, "host": addr(v), "cmd": st.agent_command(
+            "commands": [{"node": v, "host": addr(v), "cmd": agent_cmd(
                 python=python, name=name, model_dir=model_dir, role="back",
                 layers=(l0, n_layers), task=task, nodes=nodes, rank=r, master=master,
                 master_port=master_port, partition=partition, dtype=dtype,
@@ -253,7 +260,7 @@ def stages_from_color_plan(
         "kind": "tiered", "plan": plan_path, "l0": l0, "n_layers": n_layers, "n_experts": n_experts,
         "model_dir": model_dir, "fronts": [f["name"] for f in fronts],
         "backs": [b["name"] for b in backs], "channels": fronts + backs,
-        "color_plan": {"via_coordinator": via, "coordinator": coord,
+        "color_plan": {"via_coordinator": via, "coordinator": coord, "code_dir": code_dir,
                        "lr_at": "front" if lr_cfg else "gateway",
                        "gateway_cmd": " ".join(gw),
                        "theta_per_task": res.get("summary", {}).get("theta"),
@@ -286,6 +293,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="max_num_seqs = 规划估的在飞请求数 × 这个系数（向上取到 8 的倍数）")
     ap.add_argument("--front-max-num-seqs", type=int, default=None, help="所有前段统一用这个值")
     ap.add_argument("--back-max-num-seqs", type=int, default=None, help="所有后段统一用这个值")
+    ap.add_argument("--code-dir", default=None,
+                    help="节点上这份代码的目录（如 /home/ubuntu/mbf）：每条命令前加 PYTHONPATH=<目录>，"
+                         "引擎从它 import vllm，不动 venv 的可编辑安装（它可以继续指向原来的 vllm-p2p）")
     ap.add_argument("--no-front-lr", action="store_true", help="前段不开识别统计（只能 oracle）")
     g = ap.add_argument_group("前段本机 LR（LR 选择器在含第 L₀ 层的前段卡上）")
     g.add_argument("--lr-model", default=None,
@@ -326,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
             gpu_mem=a.gpu_mem, gpu_mem_node=gmn, port=a.port, master_port=a.master_port,
             front_lr=not a.no_front_lr, eager=a.eager, seqs_margin=a.seqs_margin,
             front_max_num_seqs=a.front_max_num_seqs, back_max_num_seqs=a.back_max_num_seqs,
-            plan_path=str(a.result), lr=lr)
+            plan_path=str(a.result), lr=lr, code_dir=a.code_dir)
     except (ColorPlanError, lay.LayoutError, OSError, KeyError) as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2
@@ -342,6 +352,8 @@ def main(argv: list[str] | None = None) -> int:
               f" → max_num_seqs {c['max_num_seqs']}{extra}" + (f"\n{'':26}每步批量 ≈ {sb}" if sb else ""))
     for s in notes:
         print(f"  ! {s}")
+    if a.code_dir:
+        print(f"  引擎从 {a.code_dir} import vllm（命令前加了 PYTHONPATH）；各节点上要有这份代码（含编译好的 .so）")
     if sj["color_plan"]["lr_at"] == "front":
         print(f"  LR 选择器在各前段卡本机跑（{a.lr_model}）")
     print(f"已写 {a.out}\n拉起：python3 vllm/p2p/launch.py --channels {a.out} start all")
