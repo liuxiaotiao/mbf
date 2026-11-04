@@ -47,9 +47,11 @@ def test_dense_and_grouped_match_reference(monkeypatch, T, renorm) -> None:
 def test_resolve_moe_impl(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_P2P_MOE_IMPL", raising=False)
     cfg = SimpleNamespace()
-    assert m.resolve_moe_impl(cfg, (7, 5)) == "dense"           # Turing
-    assert m.resolve_moe_impl(cfg, (8, 0)) == "triton"          # A30
-    assert m.resolve_moe_impl(cfg, None) == "triton"
+    assert m.resolve_moe_impl(cfg, (7, 5)) == "triton"          # 默认不开（后续优化项）
+    auto = SimpleNamespace(p2p_moe_impl="auto")
+    assert m.resolve_moe_impl(auto, (7, 5)) == "dense"          # Turing
+    assert m.resolve_moe_impl(auto, (8, 0)) == "triton"         # A30
+    assert m.resolve_moe_impl(auto, None) == "triton"
     assert m.resolve_moe_impl(SimpleNamespace(p2p_moe_impl="triton"), (7, 5)) == "triton"
     assert m.resolve_moe_impl(SimpleNamespace(p2p_moe_impl="dense"), (8, 6)) == "dense"
     monkeypatch.setenv("VLLM_P2P_MOE_IMPL", "triton")           # 环境变量优先
