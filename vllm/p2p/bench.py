@@ -225,6 +225,31 @@ def mark_rows(rec: Rec) -> dict:
 # --------------------------------------------------------------------------- #
 # 满载连续测试（--saturate）：逐步加压到满载，之后一条完成补一条、始终保持满载
 # --------------------------------------------------------------------------- #
+_SYNTH_WORDS = ("system data model value layer token graph network node memory route stream batch cache "
+                "result number function matrix vector signal energy market river city garden window paper "
+                "music story travel winter summer planet ocean forest mountain question answer reason "
+                "method table chair light water stone bridge train school doctor friend morning").split()
+_SYNTH_HEAD = {"gsm8k": "Solve the following math word problem step by step.",
+               "mbpp": "Write a Python function for the following task.",
+               "no_robots": "Write a helpful, natural response to the following request."}
+
+
+def synthetic_cases(tasks: Sequence[str], per_task: int, prompt_len: int,
+                    seed: int = 0) -> list[tuple[str, str]]:
+    """合成请求 → [(task, prompt)]：每个 task per_task 条、各条内容不同（不会命中前缀缓存），
+    约 prompt_len 个 token（常用英文单词，带前导空格时一般一个词一个 token）。
+    只用来测满载吞吐 / TPOT：内容与真实任务无关；配合网关 --ignore-eos 让每条都生成满 max_tokens。"""
+    import random
+    rng = random.Random(seed)
+    out = []
+    for u in tasks:
+        head = _SYNTH_HEAD.get(u, "Respond to the following text.")
+        for j in range(per_task):
+            body = " ".join(rng.choice(_SYNTH_WORDS) for _ in range(max(1, prompt_len - 16)))
+            out.append((u, f"{head} [{u}-{j}] {body}"))
+    return out
+
+
 def saturation_caps(live, channels: Mapping[str, Mapping], *, by_task: bool,
                     per_back: int = 0) -> dict:
     """满载的在途上限。按 task（by_task）：{task: (Σ 该 task 各后段的槽位, 后段数)}；
@@ -657,8 +682,15 @@ def main(argv: list[str] | None = None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gateway", default="http://127.0.0.1:9000")
     ap.add_argument("--channels", default="/home/ubuntu/vllm-p2p/p2p_channels/channels.json")
-    ap.add_argument("--cases", required=True, type=Path,
-                    help="带 task 标注的测试集（TestSamples/cases.jsonl 或 qwen3-30b/sel_cases.jsonl）")
+    ap.add_argument("--cases", default=None, type=Path,
+                    help="带 task 标注的测试集（TestSamples/cases.jsonl 或 qwen3-30b/sel_cases.jsonl）；"
+                         "用 --synthetic 时不需要")
+    ap.add_argument("--synthetic", action="store_true",
+                    help="不用真实测试集，按网关上的 task 生成合成请求（只测吞吐 / TPOT）；"
+                         "配合网关 --ignore-eos，每条都生成满 --max-tokens")
+    ap.add_argument("--synth-per-task", type=int, default=64, help="--synthetic：每个 task 几条不同的 prompt")
+    ap.add_argument("--synth-prompt-len", type=int, default=256, help="--synthetic：prompt 约几个 token")
+    ap.add_argument("--synth-seed", type=int, default=0)
     ap.add_argument("--model-dir", required=True, help="有 tokenizer.json 的目录（控制机本地）")
     ap.add_argument("--p2p-framework", default=None)
     ap.add_argument("--max-tokens", type=int, default=2048)
@@ -722,7 +754,16 @@ def main(argv: list[str] | None = None) -> int:
     textio = TextIO.from_model_dir(a.model_dir, chat=True)
     if a.thinking != "default":
         textio.template_kw["enable_thinking"] = a.thinking == "on"
-    cases = load_cases(a.cases, tasks)
+    if a.synthetic:
+        cases = synthetic_cases(tasks, a.synth_per_task, a.synth_prompt_len, a.synth_seed)
+        log.info("合成请求：%d 个 task × %d 条，prompt 约 %d token（内容与任务无关，只测吞吐 / TPOT）",
+                 len(tasks), a.synth_per_task, a.synth_prompt_len)
+        if not gw_info.get("ignore_eos"):
+            log.warning("  网关没开 --ignore-eos：合成 prompt 的输出长度不可控（可能很早遇到 EOS）")
+    elif a.cases is None:
+        raise SystemExit("要给 --cases 测试集，或者用 --synthetic 生成合成请求")
+    else:
+        cases = load_cases(a.cases, tasks)
     if mode in ("oracle", "shadow"):
         # 按标注路由时，网关上没有通道的 task 只会 503 —— 直接跳过，免得压测里混进一堆失败
         # （网关 --only 只开了部分通道、或分段网关只起了部分后段时）
@@ -731,7 +772,7 @@ def main(argv: list[str] | None = None) -> int:
             log.info("网关上没有 %s 的通道：这 %d 条跳过", sorted(set(skip)), len(skip))
             cases = [(u, p) for u, p in cases if u is None or u in tasks]
     if not cases:
-        raise SystemExit(f"{a.cases} 里一条都没有")
+        raise SystemExit(f"{a.cases or '合成请求'} 里一条都没有")
     pool = interleave(cases) if a.order == "interleave" else list(cases)
     n = len(pool) if a.requests <= 0 else a.requests
     inflight = n if a.offline else (a.inflight or len(live))

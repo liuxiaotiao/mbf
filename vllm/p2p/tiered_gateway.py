@@ -355,6 +355,7 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
         st = co.state()
         return web.json_response({
             "mode": mode, "kind": "tiered", "identifier": identifier,
+            "ignore_eos": bool(getattr(co, "ignore_eos", False)),
             "tasks": sorted({b["task"] for b in st["backs"] if b["task"]}),
             # bench 把这些当「通道」：名字要能在 stages.json 里查到 task / 节点
             "channels": [{"name": b["name"], "task": b["task"], "inflight": b["inflight"],
@@ -468,6 +469,9 @@ async def _amain(a) -> int:
         if no_kv:
             raise SystemExit(f"--kv-guard 要各引擎报 KV 块数，{no_kv} 没报（代理太旧？）")
     eos, stop_ids = load_stop_ids(a.model_dir)
+    if a.ignore_eos:          # 压测：不在 EOS / 停止 token 处停，每条都生成满 max_tokens
+        stop_ids = ()
+        print("--ignore-eos：每条请求都生成满 max_tokens（只用于测吞吐 / TPOT）", flush=True)
     tok = Tokenizer.from_file(str(Path(a.model_dir) / "tokenizer.json"))
     classify, clf, ident_desc = None, None, None
     front_lr, needs_body = False, False
@@ -502,7 +506,7 @@ async def _amain(a) -> int:
             lr_feature_fn=a.lr_feature_fn, tau_hi=a.tau_hi, tau_lo=a.tau_lo)
         ident_desc = f"前段出口 LR（{Path(a.lr_model).name}）"
         print(f"前段出口识别：{clf.describe()}；部署的 task 与先验 {tasks}", flush=True)
-    co = TieredCoordinator(fe, be, bind="least", eos=eos, stop_ids=stop_ids, ignore_eos=False,
+    co = TieredCoordinator(fe, be, bind="least", eos=eos, stop_ids=stop_ids, ignore_eos=a.ignore_eos,
                            front_pick=a.front_pick, direct=not a.via_coordinator,
                            classify=classify, route="lr" if a.mode == "lr" else "task",
                            front_lr=front_lr, routes=routes, kv_guard=kv_guard)
@@ -556,6 +560,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="KV 守卫：按各引擎的 KV 块数给每条请求预留最坏情况（prompt + max_tokens），"
                          "装不下就在网关排队，各段都不会被抢占。auto（默认）= 有中段时开（多级时各段"
                          "KV 都满会互相等死，vLLM 的抢占解不开）")
+    ap.add_argument("--ignore-eos", action="store_true",
+                    help="压测用：不在 EOS / 停止 token 处停，每条请求都生成满 max_tokens（输出长度可控）")
     ap.add_argument("--front-pick", choices=("speed", "least"), default="speed",
                     help="选前段：speed =（在飞+1）×实测每位置耗时最小（默认）；least = 在飞最少")
     ap.add_argument("--mode", choices=MODES, default="oracle",
