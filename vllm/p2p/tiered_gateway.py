@@ -540,6 +540,21 @@ async def _amain(a) -> int:
     return 0
 
 
+def raise_nofile(want: int = 65536) -> tuple[int, int]:
+    """把本进程能同时打开的文件数（含 socket）的软上限提到 min(want, 硬上限)。
+    默认软上限 1024：满载时每条在途请求占一个 HTTP 连接，上千条在途会 `Too many open files`，
+    网关 accept 不了新连接、整个压测卡住。→ (旧软上限, 新软上限)；改不了就原样返回。"""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = want if hard == resource.RLIM_INFINITY else min(want, hard)
+        if soft != resource.RLIM_INFINITY and soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        return soft, resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except (ImportError, ValueError, OSError):
+        return -1, -1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--stages", default="/home/ubuntu/vllm-p2p/p2p_channels/stages.json")
@@ -582,6 +597,10 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--tau-hi", type=float, default=None)
     g.add_argument("--tau-lo", type=float, default=0.40)
     a = ap.parse_args(argv)
+    _old, _new = raise_nofile()
+    if _new != -1 and _new < 4096:
+        print(f"警告：能同时打开的文件数上限只有 {_new}（硬上限不够），满载上千条在途会 Too many open files；"
+              "先在 shell 里 ulimit -n 65536（或改 /etc/security/limits.conf）", flush=True)
     try:
         return asyncio.run(_amain(a))
     except KeyboardInterrupt:
