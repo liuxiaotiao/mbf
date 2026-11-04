@@ -307,3 +307,33 @@ def test_multi_level_rejects_bad_routes(tmp_path):
     del res["deploy"]["routes"]
     with pytest.raises(cp.ColorPlanError, match="routes"):
         _build(tmp_path, res=res)
+
+
+def test_split_pp_turns_pipelines_into_per_card_engines(tmp_path):
+    """--split-pp：每条后段流水线拆成每卡一个引擎（中段 … → 后段），每条流水线一条路线。"""
+    inst_extra = {"n": L0, "kv_gb_per_tps_block": 0.001,
+                  "w_color_gb": {k: [0.5] * (L - L0) for k in ("gsm8k", "mbpp", "no_robots")}}
+    inst = {"L": L, "block_layers": 1, "batch": 64,
+            "gpus": [{"id": f"N{i:02d}", "type": "A30"} for i in range(1, 16)],
+            "gpu_types": {"A30": {"d_layer_ms": 3.6, "d_ms": 3.6}}, **inst_extra}
+    sj, notes = cp.stages_from_color_plan(_result(), inst, _experts(), _hosts(tmp_path), model_dir="/w",
+                                          python="/venv/bin/python", split_pp=True)
+    ch = {c["name"]: c for c in sj["channels"]}
+    assert any("--split-pp" in s for s in notes)
+    # mbpp 有两条流水线：N03+N04+N05 与 N06+N07 → 中段 3 个、后段 2 个
+    mb = [r for r in sj["routes"] if r["task"] == "mbpp"]
+    assert sorted(len(r["hops"]) for r in mb) == [2, 3]
+    for r in sj["routes"]:
+        hops = [ch[h] for h in r["hops"]]
+        assert [h["role"] for h in hops] == ["mid"] * (len(hops) - 1) + ["back"]
+        assert hops[0]["layers"][0] == L0 and hops[-1]["layers"][1] == L
+        for a_, b_ in zip(hops, hops[1:]):
+            assert a_["layers"][1] == b_["layers"][0]          # 首尾相接
+        for h in hops:
+            assert len(h["nodes"]) == 1 and h["partition"] == [h["layers"][1] - h["layers"][0]]
+            assert "VLLM_PP_LAYER_PARTITION" not in h["commands"][0]["cmd"]
+            assert "--pipeline-parallel-size 1" in h["commands"][0]["cmd"]
+    g = [r for r in sj["routes"] if r["task"] == "gsm8k"][0]
+    assert g["weight"] == pytest.approx(1000 * 240 / 1e3)
+    assert ch[g["hops"][0]]["gpu_mem"] == {"N01": 0.9}
+    assert not any(c.get("shared_gpu") for c in sj["channels"])

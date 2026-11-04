@@ -81,6 +81,34 @@ def _round_seqs(x: float, margin: float, floor: int = 16) -> int:
     return max(floor, int(math.ceil(x * margin / 8.0)) * 8)
 
 
+def _split_pp(dep: Mapping, inst: Mapping) -> dict:
+    """`--deploy` 的直线流水线 → 多级结构：每条流水线的每张卡一个引擎（最后一张是后段、其余是中段），
+    每条流水线一条路线。层、流量、循环时间都不变，只是级与级之间不再用 vLLM 的 PP。"""
+    n = int(inst.get("n", dep.get("l0", 0)))
+    kvg = float(inst.get("kv_gb_per_tps_block", 0.0))
+    wc = inst.get("w_color_gb") or {}
+    engines, routes, cnt = [], [], {}
+    for b in dep["backs"]:
+        k, names = b["task"], []
+        for idx, (v, (lo, hi)) in enumerate(zip(b["nodes"], b["layers"])):
+            role = "back" if idx == len(b["nodes"]) - 1 else "mid"
+            j = cnt.get((role, k), 0)
+            cnt[role, k] = j + 1
+            name = f"{role}-{k}-{j}"
+            w = (round(sum(wc[k][l - n - 1] for l in range(lo, hi + 1)), 3)
+                 if k in wc and len(wc[k]) >= hi - n else None)
+            engines.append({"name": name, "role": role, "task": k, "nodes": [v], "layers": [[lo, hi]],
+                            "weights_gb": [w], "kv_gb": [round(kvg * b["tokens_per_s"] * (hi - lo + 1), 3)],
+                            "tokens_per_s": b["tokens_per_s"], "routes": 1})
+            names.append(name)
+        routes.append({"task": k, "engines": names, "tokens_per_s": b["tokens_per_s"],
+                       "share_of_task": b.get("share_of_task"), "avg_cycle_ms": b["avg_cycle_ms"],
+                       "weight": round(b["tokens_per_s"] * b["avg_cycle_ms"] / 1e3, 3),
+                       "local_hops": 0})
+    return {**dep, "interleave": True, "backs": [], "engines": engines, "routes": routes,
+            "split_pp": True}
+
+
 def _multi_engines(dep, inst, tasks_ex, hosts, *, l0, n_layers, bl, n_experts, python, model_dir,
                    dtype, attention_backend, max_model_len, gpu_mem, gmn, port, master_port, eager,
                    seqs_margin, back_max_num_seqs, agent_cmd, step_batch, check_batch, notes,
@@ -232,7 +260,7 @@ def stages_from_color_plan(
     port: int = 8300, master_port: int = 29600, front_lr: bool = True, eager: bool = False,
     seqs_margin: float = 1.3, front_max_num_seqs: int | None = None,
     back_max_num_seqs: int | None = None, plan_path: str | None = None,
-    lr: Mapping | None = None, code_dir: str | None = None,
+    lr: Mapping | None = None, code_dir: str | None = None, split_pp: bool = False,
 ) -> tuple[dict, list[str]]:
     """`lr`：前段本机 LR 的配置（写进前段 hf_overrides 的 `p2p_lr`），至少有 `model`；
     `tasks` 不给就用后段覆盖到的 task、先验各 1。
@@ -258,6 +286,10 @@ def stages_from_color_plan(
     gmn = dict(gpu_mem_node or {})
     notes: list[str] = []
 
+    if split_pp and not dep.get("interleave"):
+        dep = _split_pp(dep, inst)
+        notes.append("--split-pp：后段流水线拆成每卡一个引擎（中段…中段 → 后段），级与级之间走 p2p "
+                     "直连传 hidden，不用 vLLM 的 PP（NCCL 收发）")
     multi = bool(dep.get("interleave")) and bool(dep.get("routes"))
     if dep.get("interleave") and not dep.get("routes"):
         raise ColorPlanError("--interleave 的结果里没有 routes / engines —— 用新版 moe_color_planner.py 重新求解")
@@ -457,6 +489,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="节点上这份代码的目录（如 /home/ubuntu/mbf）：每条命令前加 PYTHONPATH=<目录>，"
                          "引擎从它 import vllm，不动 venv 的可编辑安装（它可以继续指向原来的 vllm-p2p）")
     ap.add_argument("--no-front-lr", action="store_true", help="前段不开识别统计（只能 oracle）")
+    ap.add_argument("--split-pp", action="store_true",
+                    help="后段流水线不用 vLLM 的 PP：每张卡一个引擎（中段 → … → 后段），级与级之间走 p2p "
+                         "直连传 hidden（多级运行时；网关有中段时自动开 KV 守卫）")
     g = ap.add_argument_group("前段本机 LR（LR 选择器在含第 L₀ 层的前段卡上）")
     g.add_argument("--lr-model", default=None,
                    help="选择器参数文件（前段卡上的路径），如 /home/ubuntu/p2p-framework/selector/"
@@ -496,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
             gpu_mem=a.gpu_mem, gpu_mem_node=gmn, port=a.port, master_port=a.master_port,
             front_lr=not a.no_front_lr, eager=a.eager, seqs_margin=a.seqs_margin,
             front_max_num_seqs=a.front_max_num_seqs, back_max_num_seqs=a.back_max_num_seqs,
-            plan_path=str(a.result), lr=lr, code_dir=a.code_dir)
+            plan_path=str(a.result), lr=lr, code_dir=a.code_dir, split_pp=a.split_pp)
     except (ColorPlanError, lay.LayoutError, OSError, KeyError) as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2
