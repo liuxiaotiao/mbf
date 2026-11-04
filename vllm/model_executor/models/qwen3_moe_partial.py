@@ -54,6 +54,22 @@ lm_head；后段：embed_tokens 换成 `ZeroEmbed`（每个位置都由前段的
 （输入是上一段的 hidden、输出交给下一段）。
 协议与调度见 `vllm/p2p/stage.py`。
 
+Turing 上的 MoE（`p2p_moe_impl`）
+------------------------------
+vLLM 0.14 的 Triton `fused_experts` 在 sm75（RTX 6000 / T4）上极慢：单卡实测 E=64、T=320 时
+RTX 6000 27 ms、T4 46 ms（折合 0.5–0.9 TFLOPS，不到卡的 2%），而 A30 1.2 ms
+（`vllm/p2p/moe_kernel_bench.py`）。所以 sm < 8.0 时改走自定义算子 `vllm.p2p_dense_moe`：
+
+* 一步 ≤ `VLLM_P2P_DENSE_MOE_MAX_TOKENS`（默认 512，覆盖 CUDA Graph 抓的 decode 形状）：
+  每个 token 过本层**全部**驻留专家（cuBLAS 批量矩阵乘，走 tensor core），再按路由权重
+  （非 top-k 为 0）加权求和 —— 多算 E/top-k 倍，但形状固定、能进 CUDA Graph；
+  同样形状 RTX 6000 3.7 ms、T4 12.6 ms；
+* 更大的一步（prefill / 混合批，不在 CUDA Graph 里）：按专家分组、每个专家一次 cuBLAS 矩阵乘。
+
+路由与 FusedMoE 相同：softmax → top-k → 重归一（`renormalize`）。`p2p_moe_impl`（hf_overrides）
+或环境变量 `VLLM_P2P_MOE_IMPL` 取 `auto`（默认：sm < 8.0 用 dense）/ `dense` / `triton`。
+只支持 TP = 1、非 sequence-parallel（否则退回 FusedMoE）。
+
 逐专家核对
 ----------
 严格检查是**按参数**的：`experts.w13_weight` 是 n 个专家堆在一起的一个参数，只要其中
@@ -64,6 +80,7 @@ lm_head；后段：embed_tokens 换成 `ZeroEmbed`（每个位置都由前段的
 
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -132,6 +149,119 @@ direct_register_custom_op(
 )
 
 
+# --------------------------------------------------------------------------- #
+# Turing（sm < 8.0）：不走 Triton fused_experts 的 MoE（见模块文档）
+# --------------------------------------------------------------------------- #
+MOE_IMPLS = ("auto", "dense", "triton")
+
+
+def dense_max_tokens() -> int:
+    return int(os.environ.get("VLLM_P2P_DENSE_MOE_MAX_TOKENS", "512"))
+
+
+def route_topk(router_logits: torch.Tensor, top_k: int,
+               renormalize: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """与 FusedMoE 的 Renormalize 路由相同：softmax → top-k →（重归一）。→ (权重 fp32, 本地专家号)。"""
+    w, i = router_logits.float().softmax(-1).topk(top_k, dim=-1)
+    if renormalize:
+        w = w / w.sum(-1, keepdim=True)
+    return w, i
+
+
+def moe_dense(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor,
+              tw: torch.Tensor, ti: torch.Tensor) -> torch.Tensor:
+    """每个 token 过全部 E 个专家（批量矩阵乘），按路由权重加权求和。形状只依赖 T，能进 CUDA Graph。
+    w13 [E, 2I, H]（前一半 gate、后一半 up），w2 [E, H, I]（FusedMoE 的布局）。"""
+    E, inter = w13.shape[0], w2.shape[2]
+    h = torch.bmm(x.unsqueeze(0).expand(E, -1, -1), w13.transpose(1, 2))      # [E, T, 2I]
+    a = torch.nn.functional.silu(h[..., :inter]) * h[..., inter:]              # [E, T, I]
+    y = torch.bmm(a, w2.transpose(1, 2))                                       # [E, T, H]
+    wd = torch.zeros(x.shape[0], E, device=x.device, dtype=torch.float32).scatter_(1, ti.long(), tw)
+    return torch.einsum("te,eth->th", wd.to(x.dtype), y)
+
+
+def moe_grouped(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor,
+                tw: torch.Tensor, ti: torch.Tensor) -> torch.Tensor:
+    """按专家分组、每个专家一次矩阵乘。有主机同步（每个专家多少 token），只用在不进 CUDA Graph 的大步。"""
+    T, H = x.shape
+    inter = w2.shape[2]
+    flat = ti.reshape(-1).long()
+    tok = torch.arange(T, device=x.device).repeat_interleave(ti.shape[1])
+    wt = tw.reshape(-1)
+    order = flat.argsort()
+    flat, tok, wt = flat[order], tok[order], wt[order]
+    counts = torch.bincount(flat, minlength=w13.shape[0]).tolist()
+    out = torch.zeros(T, H, device=x.device, dtype=torch.float32)
+    s = 0
+    for e, c in enumerate(counts):
+        if c:
+            idx = tok[s:s + c]
+            h = x.index_select(0, idx) @ w13[e].t()
+            a = torch.nn.functional.silu(h[:, :inter]) * h[:, inter:]
+            out.index_add_(0, idx, (a @ w2[e].t()).float() * wt[s:s + c, None])
+            s += c
+    return out.to(x.dtype)
+
+
+def p2p_dense_moe(hidden_states: torch.Tensor, router_logits: torch.Tensor, w13: torch.Tensor,
+                  w2: torch.Tensor, top_k: int, renormalize: bool) -> torch.Tensor:
+    if hidden_states.shape[0] == 0:
+        return torch.empty_like(hidden_states)
+    tw, ti = route_topk(router_logits, top_k, renormalize)
+    if hidden_states.shape[0] <= dense_max_tokens():
+        return moe_dense(hidden_states, w13, w2, tw, ti)
+    return moe_grouped(hidden_states, w13, w2, tw, ti)
+
+
+def _p2p_dense_moe_fake(hidden_states: torch.Tensor, router_logits: torch.Tensor,
+                        w13: torch.Tensor, w2: torch.Tensor, top_k: int,
+                        renormalize: bool) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="p2p_dense_moe",
+    op_func=p2p_dense_moe,
+    mutates_args=[],
+    fake_impl=_p2p_dense_moe_fake,
+)
+
+
+def resolve_moe_impl(config, capability: tuple[int, int] | None) -> str:
+    """→ "dense" 或 "triton"。环境变量优先于 hf_overrides 的 `p2p_moe_impl`。"""
+    want = (os.environ.get("VLLM_P2P_MOE_IMPL") or getattr(config, "p2p_moe_impl", None)
+            or "auto").lower()
+    if want not in MOE_IMPLS:
+        raise ValueError(f"p2p_moe_impl={want!r}；可选 {MOE_IMPLS}")
+    if want == "auto":
+        return "dense" if capability is not None and tuple(capability) < (8, 0) else "triton"
+    return want
+
+
+def _device_capability() -> tuple[int, int] | None:
+    try:
+        if torch.cuda.is_available():
+            return tuple(torch.cuda.get_device_capability())
+    except Exception:          # noqa: BLE001
+        pass
+    return None
+
+
+_LOGGED_IMPL: set[str] = set()
+
+
+def _pick_dense(block, config) -> bool:
+    impl = resolve_moe_impl(config, _device_capability())
+    if impl == "dense" and (get_tensor_model_parallel_world_size() != 1
+                            or getattr(block, "is_sequence_parallel", False)):
+        impl = "triton"            # dense 路径不做 TP 规约 / sequence-parallel 切分
+    if impl not in _LOGGED_IMPL:
+        _LOGGED_IMPL.add(impl)
+        logger.info("p2p MoE：%s（sm=%s；dense = cuBLAS 批量矩阵乘，≤ %d token 一步全专家，"
+                    "更大按专家分组）", impl, _device_capability(), dense_max_tokens())
+    return impl == "dense"
+
+
 _PARSED: dict[int, dict[int, tuple[int, ...]]] = {}
 
 
@@ -165,6 +295,7 @@ class PartialQwen3MoeSparseMoeBlock(_q.Qwen3MoeSparseMoeBlock):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
             self.resident: tuple[int, ...] | None = None
             self.p2p_slot: int | None = None
+            self.p2p_dense = _pick_dense(self, config)
             if st is not None:
                 if self.is_sequence_parallel or self.enable_eplb or self.ep_size != 1:
                     raise ValueError("A5 统计钩子不支持 sequence-parallel MoE / EP / EPLB")
@@ -225,20 +356,28 @@ class PartialQwen3MoeSparseMoeBlock(_q.Qwen3MoeSparseMoeBlock):
         self.register_buffer(
             "resident_idx", torch.tensor(self.resident, dtype=torch.long), persistent=False)
         self.p2p_slot = st.register_layer(layer, self.resident) if st is not None else None
+        self.p2p_dense = _pick_dense(self, config)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.resident is None and self.p2p_slot is None:
+        if self.resident is None and self.p2p_slot is None and not self.p2p_dense:
             return super().forward(hidden_states)
         assert hidden_states.dim() <= 2
         is_input_1d = hidden_states.dim() == 1
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         router_logits, _ = self.gate(hidden_states)                 # [T, E] 全量
-        if self.p2p_slot is None:
-            local_logits = router_logits.index_select(-1, self.resident_idx)   # [T, n]
-        else:
+        if self.p2p_slot is not None:
             local_logits = torch.ops.vllm.p2p_route_select(
                 router_logits, self.resident_idx, self.p2p_slot)
-        out = self.experts(hidden_states=hidden_states, router_logits=local_logits)
+        elif self.resident is not None:
+            local_logits = router_logits.index_select(-1, self.resident_idx)   # [T, n]
+        else:
+            local_logits = router_logits                            # 装全的层
+        if self.p2p_dense:
+            ex = self.experts
+            out = torch.ops.vllm.p2p_dense_moe(hidden_states, local_logits, ex.w13_weight,
+                                               ex.w2_weight, int(ex.top_k), bool(ex.renormalize))
+        else:
+            out = self.experts(hidden_states=hidden_states, router_logits=local_logits)
         return out.squeeze(0) if is_input_1d else out
 
 
