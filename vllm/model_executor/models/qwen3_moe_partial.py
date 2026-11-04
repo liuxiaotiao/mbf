@@ -58,7 +58,7 @@ Turing 上的 MoE（`p2p_moe_impl`）
 ------------------------------
 vLLM 0.14 的 Triton `fused_experts` 在 sm75（RTX 6000 / T4）上极慢：单卡实测 E=64、T=320 时
 RTX 6000 27 ms、T4 46 ms（折合 0.5–0.9 TFLOPS，不到卡的 2%），而 A30 1.2 ms
-（`vllm/p2p/moe_kernel_bench.py`）。可选的替代是自定义算子 `vllm.p2p_dense_moe`：
+（`vllm/p2p/moe_kernel_bench.py`）。所以 sm < 8.0 时默认改走自定义算子 `vllm.p2p_dense_moe`：
 
 * 一步 ≤ `VLLM_P2P_DENSE_MOE_MAX_TOKENS`（默认 512，覆盖 CUDA Graph 抓的 decode 形状）：
   每个 token 过本层**全部**驻留专家（cuBLAS 批量矩阵乘，走 tensor core），再按路由权重
@@ -66,9 +66,9 @@ RTX 6000 27 ms、T4 46 ms（折合 0.5–0.9 TFLOPS，不到卡的 2%），而 A
   同样形状 RTX 6000 3.7 ms、T4 12.6 ms；
 * 更大的一步（prefill / 混合批，不在 CUDA Graph 里）：按专家分组、每个专家一次 cuBLAS 矩阵乘。
 
-路由与 FusedMoE 相同：softmax → top-k → 重归一（`renormalize`）。**默认不开**（`triton`，与现有规划、
-实测口径一致；列为后续优化项）。`p2p_moe_impl`（hf_overrides）或环境变量 `VLLM_P2P_MOE_IMPL`
-取 `triton`（默认）/ `auto`（sm < 8.0 用 dense）/ `dense`。
+路由与 FusedMoE 相同：softmax → top-k → 重归一（`renormalize`）。`p2p_moe_impl`（hf_overrides）
+或环境变量 `VLLM_P2P_MOE_IMPL` 取 `auto`（默认：sm < 8.0 用 dense，A30 等仍走 Triton）/ `dense` /
+`triton`（Turing 上也走 Triton，对比用）。
 只支持 TP = 1、非 sequence-parallel（否则退回 FusedMoE）。
 
 逐专家核对
@@ -229,9 +229,9 @@ direct_register_custom_op(
 
 
 def resolve_moe_impl(config, capability: tuple[int, int] | None) -> str:
-    """→ "dense" 或 "triton"。环境变量优先于 hf_overrides 的 `p2p_moe_impl`；都没给 = triton。"""
+    """→ "dense" 或 "triton"。环境变量优先于 hf_overrides 的 `p2p_moe_impl`；都没给 = auto。"""
     want = (os.environ.get("VLLM_P2P_MOE_IMPL") or getattr(config, "p2p_moe_impl", None)
-            or "triton").lower()
+            or "auto").lower()
     if want not in MOE_IMPLS:
         raise ValueError(f"p2p_moe_impl={want!r}；可选 {MOE_IMPLS}")
     if want == "auto":

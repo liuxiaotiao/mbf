@@ -47,7 +47,8 @@ def test_dense_and_grouped_match_reference(monkeypatch, T, renorm) -> None:
 def test_resolve_moe_impl(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_P2P_MOE_IMPL", raising=False)
     cfg = SimpleNamespace()
-    assert m.resolve_moe_impl(cfg, (7, 5)) == "triton"          # 默认不开（后续优化项）
+    assert m.resolve_moe_impl(cfg, (7, 5)) == "dense"           # 默认 auto：Turing 走 cuBLAS
+    assert m.resolve_moe_impl(cfg, (8, 0)) == "triton"
     auto = SimpleNamespace(p2p_moe_impl="auto")
     assert m.resolve_moe_impl(auto, (7, 5)) == "dense"          # Turing
     assert m.resolve_moe_impl(auto, (8, 0)) == "triton"         # A30
