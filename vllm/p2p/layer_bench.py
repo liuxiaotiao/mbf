@@ -34,8 +34,9 @@ fp16、TRITON_ATTN、CUDA Graph（`--eager` 关掉）。每个配置在单独的
 
 * decode 一步：先发 B 条长 C 的随机 prompt 只生成 1 个 token（= prefill + 1 步），再发同样的
   B 条生成 1+K 个，两者之差 / K = 一步 decode（上下文从 C 涨到 C+K，取的是这一段的平均）。
-  重复 `--repeats` 次取中位数。`max_num_batched_tokens` 设成 max(B)×max(C)，让 B 条的 prefill
-  一步做完、不和 decode 混在同一步里。
+  重复 `--repeats` 次取中位数。同一组 prompt 反复用、引擎开前缀缓存：两次的 prompt 都命中缓存，
+  各只重算最后不满一块的几个位置，相减后只剩 K 步 decode。所以 `max_num_batched_tokens`
+  不用设成 B×C（`--max-batched-tokens`，默认 16384；B=320、C=1280 时设成 B×C 会在 profile 时 OOM）。
 * prefill：B=1、长 P 的 prompt 只生成 1 个 token 的耗时（每条 prompt 都是新随机的，不命中前缀缓存）。
 
 随机权重的路由近似均匀，batch > 1 时碰到的专家数比真实路由（偏斜）略多 —— decode 的单条
@@ -466,11 +467,16 @@ def measure(llm, *, batches: Sequence[int], contexts: Sequence[int], decode_step
     for c in contexts:
         row = out["decode"][str(c)] = {}
         for b in batches:
-            _time_generate(llm, prompts(b, c), sp(1 + min(decode_steps, 8)))   # 预热这个形状
+            # 同一组 prompt 反复用：引擎开了前缀缓存，第一次之后这 B 条的 prompt 都命中缓存，
+            # 「1 个 token」「1+K 个 token」两次各只重算最后不满一块的那几个位置。所以大 B × 长 C
+            # 也不用把 B 条的 prefill 塞进一步（max_num_batched_tokens 不必 = B × C，否则 B=320、
+            # C=1280 时 profile 一步 40 万 token 直接 OOM），两次之差仍只剩 K 步 decode。
+            ps = prompts(b, c)
+            _time_generate(llm, ps, sp(1 + min(decode_steps, 8)))   # 预热这个形状，顺带填好前缀缓存
             ds = []
             for _ in range(repeats):
-                t1 = _time_generate(llm, prompts(b, c), sp(1))
-                tk = _time_generate(llm, prompts(b, c), sp(1 + decode_steps))
+                t1 = _time_generate(llm, ps, sp(1))
+                tk = _time_generate(llm, ps, sp(1 + decode_steps))
                 ds.append((tk - t1) / decode_steps)
             row[str(b)] = round(st.median(ds), 4)
         log(f"    decode C={c:<5} " + "  ".join(f"B={b}:{v:.3f}" for b, v in row.items()) + " ms/步")
@@ -497,6 +503,7 @@ def _worker(argv: Sequence[str]) -> int:
     ap.add_argument("--dtype", default="half")
     ap.add_argument("--attention-backend", default="TRITON_ATTN")
     ap.add_argument("--eager", action="store_true")
+    ap.add_argument("--max-batched-tokens", type=int, default=16384)
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     # collective_rpc 要把 mem_probe 这个函数发给 worker（按模块路径引用，worker 里同样 import 得到）
@@ -512,9 +519,11 @@ def _worker(argv: Sequence[str]) -> int:
     kw = dict(model=a.model_dir, dtype=a.dtype, load_format="dummy", skip_tokenizer_init=True,
               hf_overrides=_overrides(a.layers, a.experts, int(cfg["num_experts"])),
               max_model_len=mml, max_num_seqs=max(batches), gpu_memory_utilization=a.gpu_mem,
-              # B 条的 prefill 一步做完，不和 decode 混在同一步里（显存账里的峰值也就按这个算）
-              max_num_batched_tokens=max(mml, max(batches) * max(contexts)),
-              enable_prefix_caching=False, enforce_eager=a.eager, seed=0,
+              # 一步最多这么多 token：decode 的量法靠前缀缓存（见 measure），不需要 B 条的 prefill
+              # 一步做完；上限压住 profile 时的激活峰值（B × C 很大时不至于 OOM）
+              max_num_batched_tokens=max(mml, max(batches),
+                                         min(a.max_batched_tokens, max(batches) * max(contexts))),
+              enable_prefix_caching=True, enforce_eager=a.eager, seed=0,
               # 与分段引擎相同（stage_agent 关了异步调度）；也让一步 = CPU + GPU 串行，
               # 层数相减才能干净地只剩 GPU 上那几层
               async_scheduling=False)
@@ -587,7 +596,8 @@ def cmd_run(a) -> int:
                        "--contexts", ",".join(map(str, contexts)),
                        "--decode-steps", str(a.decode_steps), "--repeats", str(a.repeats),
                        "--gpu-mem", str(a.gpu_mem), "--dtype", a.dtype,
-                       "--attention-backend", a.attention_backend, "--out", str(out)]
+                       "--attention-backend", a.attention_backend,
+                       "--max-batched-tokens", str(a.max_batched_tokens), "--out", str(out)]
                 if a.eager:
                     cmd.append("--eager")
                 print(f"  → L={l} E={e} …", flush=True)
@@ -689,7 +699,8 @@ def remote_command(node: str, a) -> str:
     args = ["run", "--model-dir", a.model_dir, "--node", node, "--out", f"/tmp/layer_bench_{node}.json",
             "--layers", a.layers, "--experts", a.experts, "--batches", a.batches,
             "--lengths", a.lengths, "--decode-steps", str(a.decode_steps),
-            "--repeats", str(a.repeats), "--gpu-mem", str(a.gpu_mem), "--ref-batch", str(a.ref_batch),
+            "--repeats", str(a.repeats), "--gpu-mem", str(a.gpu_mem),
+            "--max-batched-tokens", str(a.max_batched_tokens), "--ref-batch", str(a.ref_batch),
             "--ref-experts", str(a.ref_experts), "--ref-context", str(a.ref_context)]
     if a.prefill:
         args += ["--prefill", a.prefill]
@@ -812,6 +823,9 @@ def _common(ap) -> None:
     ap.add_argument("--decode-steps", type=int, default=32, help="每次多生成几个 token 来量 decode")
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--gpu-mem", type=float, default=0.85)
+    ap.add_argument("--max-batched-tokens", type=int, default=16384,
+                    help="引擎一步最多几个 token（vLLM 的 max_num_batched_tokens；大 batch × 长上下文时"
+                         "别设太大，profile 激活会 OOM）")
     ap.add_argument("--eager", action="store_true", help="不用 CUDA Graph（部署时是用的）")
     ap.add_argument("--ref-batch", type=int, default=1, help="summary.ms_per_layer 取哪个 batch")
     ap.add_argument("--ref-experts", type=int, default=128, help="summary.ms_per_layer 取哪档专家数")

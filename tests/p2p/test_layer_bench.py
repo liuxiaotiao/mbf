@@ -196,7 +196,8 @@ def test_cluster_defaults_to_all_nodes(tmp_path, capsys) -> None:
         LB.pick_nodes(hosts, "N99")
     a = SimpleNamespace(model_dir="/w", layers="2,6", experts="128,64", batches="1,4",
                         lengths="128:1024:128", prefill=None, contexts="256,512", decode_steps=32,
-                        repeats=3, gpu_mem=0.85, ref_batch=1, ref_experts=128, ref_context="mean",
+                        repeats=3, gpu_mem=0.85, max_batched_tokens=16384,
+                        ref_batch=1, ref_experts=128, ref_context="mean",
                         eager=False, force=False, repo="/home/ubuntu/vllm-p2p",
                         python="/home/ubuntu/venvs/vllm-p2p/bin/python")
     cmd = LB.remote_command("N09", a)
@@ -204,6 +205,7 @@ def test_cluster_defaults_to_all_nodes(tmp_path, capsys) -> None:
                           "vllm.p2p.layer_bench run ")
     assert "--node N09" in cmd and "--out /tmp/layer_bench_N09.json" in cmd and "--eager" not in cmd
     assert "--lengths 128:1024:128" in cmd and "--contexts 256,512" in cmd and "--prefill" not in cmd
+    assert "--max-batched-tokens 16384" in cmd
     # 汇总表能打出来（均值表：上下文 × batch 一格一格）
     LB.print_gpu_summary(LB.aggregate(RES))
     txt = capsys.readouterr().out
