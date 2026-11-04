@@ -15,7 +15,7 @@
 #   SRC        代码目录（修改后的 vLLM）  默认 /home/ubuntu/vllm-p2p
 #   VENV       本机装好的 venv            默认 /home/ubuntu/venvs/vllm-p2p
 #   WHEELHOUSE wheel 仓库（本机与各节点同一路径）默认 /home/ubuntu/vllm-p2p-wheels
-#   MOE_PY     moe 的 python              默认 /home/ubuntu/anaconda3/envs/moe/bin/python
+#   MOE_PY     moe 的 python              默认 /home/ubuntu/miniforge3/envs/moe/bin/python
 #   HOSTS      节点表                     默认 /home/ubuntu/p2p-framework/task/hosts.txt
 #   SSH_USER                              默认 ubuntu
 #   JOBS       同时处理几台               默认 4（推 wheel 仓库时本机网卡是瓶颈）
@@ -24,7 +24,7 @@ set -euo pipefail
 SRC=${SRC:-/home/ubuntu/vllm-p2p}
 VENV=${VENV:-/home/ubuntu/venvs/vllm-p2p}
 WHEELHOUSE=${WHEELHOUSE:-/home/ubuntu/vllm-p2p-wheels}
-MOE_PY=${MOE_PY:-/home/ubuntu/anaconda3/envs/moe/bin/python}
+MOE_PY=${MOE_PY:-/home/ubuntu/miniforge3/envs/moe/bin/python}
 HOSTS=${HOSTS:-/home/ubuntu/p2p-framework/task/hosts.txt}
 SSH_USER=${SSH_USER:-ubuntu}
 JOBS=${JOBS:-4}

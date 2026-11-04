@@ -21,14 +21,14 @@
 #
 # 可覆盖的变量（一般不用改）：
 #   SRC        本目录（修改后的 vLLM）    默认 /home/ubuntu/vllm-p2p
-#   MOE_PY     moe 环境的 python          默认 /home/ubuntu/anaconda3/envs/moe/bin/python
+#   MOE_PY     moe 环境的 python          默认 /home/ubuntu/miniforge3/envs/moe/bin/python
 #   VENV       venv                       默认 /home/ubuntu/venvs/vllm-p2p
 #   WHEELHOUSE 本地 wheel 仓库            默认 /home/ubuntu/vllm-p2p-wheels（不存在就联网）
 #   WHEEL      官方 vllm-0.14.0 wheel     默认在 WHEELHOUSE 里找，找不到就下载
 set -euo pipefail
 
 SRC=${SRC:-/home/ubuntu/vllm-p2p}
-MOE_PY=${MOE_PY:-/home/ubuntu/anaconda3/envs/moe/bin/python}
+MOE_PY=${MOE_PY:-/home/ubuntu/miniforge3/envs/moe/bin/python}
 VENV=${VENV:-/home/ubuntu/venvs/vllm-p2p}
 WHEELHOUSE=${WHEELHOUSE:-/home/ubuntu/vllm-p2p-wheels}
 WHEEL=${WHEEL:-}
